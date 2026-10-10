@@ -8,9 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-# Optional upstream protocol set; Rust X omits it by default.
+# Upstream protocols remain available; the explicit Rust X build omits them.
 legacy-protocols = []
-default = ["full"]
+default = ["full", "legacy-protocols"]
+rust-x = ["full"]
 full = ["brotli", "regex"]
 
 [dependencies]

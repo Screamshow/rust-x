@@ -28,7 +28,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --features legacy-protocols -- -D warnings
-      - run: cargo test -p core-config --test rust_x_profile
+      - run: cargo test -p core-config --no-default-features --features rust-x --test rust_x_profile
+      - run: cargo check --workspace --no-default-features --features rust-x
       - run: cargo test --workspace --features legacy-protocols
       # The exit gate needs CAP_NET_ADMIN (tproxy); re-run it as root so CI
       # covers what the unprivileged `cargo test` above can only skip.
@@ -82,7 +83,7 @@ jobs:
           sudo apt-get install -y musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
-        run: cargo build --locked --workspace --release --target ${{ matrix.target }}
+        run: cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
       - name: Size budget (<= 12 MiB)
         run: |
           size=$(stat -c%s "target/${{ matrix.target }}/release/tachyon-core")

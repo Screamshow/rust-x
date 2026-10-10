@@ -13,7 +13,8 @@ path = "src/main.rs"
 
 [features]
 legacy-protocols = ["core-runtime/legacy-protocols", "core-config/legacy-protocols"]
-default = ["full"]
+rust-x = ["full"]
+default = ["full", "legacy-protocols"]
 full = [
     "core-config/full",
     "core-runtime/full",

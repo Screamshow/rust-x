@@ -7,7 +7,7 @@ Other platform code inherited from upstream is not a supported build target.
 Firefox/Safari and Chrome for XHTTP now use our Sing-Box X 1.0.3 captures.
 See [the uTLS refresh report](RUST-X-UTLS-2026-10-10.md).
 
-The default build excludes Naive, VMess, Trojan, Shadowsocks, TUIC, AnyTLS,
+The explicit `rust-x` release build excludes Naive, VMess, Trojan, Shadowsocks, TUIC, AnyTLS,
 Snell, ShadowTLS, FPTN, outbound SOCKS and OpenVPN. Config `check` rejects
 these types. SOCKS4/4a client requests are rejected; SOCKS5 and HTTP mixed
 inbounds remain available for Forkop DirectProxy.
@@ -16,10 +16,18 @@ VLESS/Vision, TLS/uTLS/REALITY, WebSocket, HTTPUpgrade, HTTP/2, gRPC, XHTTP,
 Hysteria2, WireGuard/AmneziaWG, MASQUE, Tailscale, DNS, SRS, TProxy, Redirect,
 TUN, direct, selectors/urltest and Clash API remain enabled.
 
-Build: `cargo build --locked --release --target x86_64-unknown-linux-musl`.
-For an upstream protocol comparison add `--features legacy-protocols`.
-This feature is opt-in, including when `full` is enabled. Upstream protocol
-tests require it; profile tests use `cargo test -p core-config --test rust_x_profile`.
+Release build: `cargo build --locked -p core-cli --no-default-features --features rust-x --release --target x86_64-unknown-linux-musl`.
+Ordinary Cargo builds include the retained upstream protocol set by default
+through `legacy-protocols`. This keeps upstream development and protocol tests
+available without changing the reduced Forkop package profile. Cargo features
+are additive: `--features rust-x` alone does not disable the default protocols;
+release builds must also pass `--no-default-features`.
+Profile tests: `cargo test -p core-config --no-default-features --features rust-x --test rust_x_profile`.
+
+Protocol source is retained rather than deleted. Keep fork-specific fixes in
+focused commits and port upstream changes without replacing our DNS, routing,
+monitoring or OpenWrt behavior. The default profile restores protocols already
+present in this fork; it does not automatically import newer upstream protocols.
 
 Shared helpers under VMess/Shadowsocks/FPTN remain in the source because
 retained protocols use them. Release LTO removes unreachable implementations;

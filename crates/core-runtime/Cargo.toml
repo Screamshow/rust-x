@@ -8,9 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-# Optional upstream protocol set; Rust X omits it by default.
+# Upstream protocols remain available; the explicit Rust X build omits them.
 legacy-protocols = ["core-config/legacy-protocols", "dep:argon2", "dep:blowfish", "dep:cast5", "dep:des", "dep:ripemd", "dep:aria", "dep:camellia", "dep:sm4", "dep:kisaseed", "dep:lz4_flex", "dep:cipher05"]
-default = ["full"]
+default = ["full", "legacy-protocols"]
+rust-x = ["full"]
 full = [
     "clash-api",
     "core-config/full",

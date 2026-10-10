@@ -41,7 +41,7 @@ jobs:
           sudo apt-get install -y musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
-        run: cargo build --locked --workspace --release --target ${{ matrix.target }}
+        run: cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
       - name: Size budget (12 MiB)
         run: test "$(stat -c%s target/${{ matrix.target }}/release/tachyon-core)" -le 12582912
       - name: Architecture check
