@@ -83,7 +83,7 @@ def main():
         run(*ssh, command)
         # Verification is performed on the signer against the existing trusted
         # public key before any release asset is replaced.
-        run(*ssh, f'cd {remote} && {APK} --keys-dir . verify rust-x_{version}-r1_aarch64_cortex-a53.apk rust-x_{version}-r1_x86_64.apk && sha256sum -c OPENWRT-SHA256SUMS')
+        run(*ssh, f'cd {remote} && {APK} --keys-dir {remote} verify rust-x_{version}-r1_aarch64_cortex-a53.apk rust-x_{version}-r1_x86_64.apk && sha256sum -c OPENWRT-SHA256SUMS')
         names = [a['file'] for a in manifest['assets']] + ['openwrt-manifest.json', 'forkop-apk.pem', 'OPENWRT-SHA256SUMS']
         for name in names:
             run(*scp, f'{HOST}:{remote}/{name}', str(args.output / name))
