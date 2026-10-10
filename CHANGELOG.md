@@ -3,6 +3,20 @@
 All notable changes to tachyon-core. The version is the workspace version in
 `Cargo.toml`; a tag that disagrees with it is refused by the release workflow.
 
+## 0.0.4
+
+- Accept single IPv4/IPv6 addresses in DNS source_ip_cidr and ip_cidr rules.
+- Preserve strict validation for explicit prefixes and invalid addresses.
+- Add host-address matching and invalid-address regression tests.
+- Limit supported build platforms to OpenWrt ARM64 and x86_64.
+
+## 0.0.3
+
+- Fix sequential DNS evaluate, response matching and respond.
+- Share remote DNS rule sets with the runtime router, including SRS.
+- Reload configuration on SIGHUP with cleanup and startup recovery.
+- Add focused DNS, remote rule-set and reload regression tests.
+
 ## 0.0.2
 
 - Ported upstream DNS RCODE names with checked numeric conversion.
