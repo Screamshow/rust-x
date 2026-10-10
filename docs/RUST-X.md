@@ -1,5 +1,8 @@
 # Rust X protocol profile
 
+Firefox/Safari and Chrome for XHTTP now use our Sing-Box X 1.0.3 captures.
+See [the uTLS refresh report](RUST-X-UTLS-2026-10-10.md).
+
 The default build excludes Naive, VMess, Trojan, Shadowsocks, TUIC, AnyTLS,
 Snell, ShadowTLS, FPTN, outbound SOCKS and OpenVPN. Config `check` rejects
 these types. SOCKS4/4a client requests are rejected; SOCKS5 and HTTP mixed
