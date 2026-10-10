@@ -354,8 +354,14 @@ impl DnsService {
         let (query_msg, info) = codec::parse_query(query)?;
         let mut opts = WalkOptions::default();
         let mut target: Option<Arc<ServerConfig>> = None;
+        let mut evaluated: Option<(Vec<u8>, bool)> = None;
+        let mut answer_ips = Vec::new();
         for rule in &self.rules {
-            if !rule.matches(meta, &info) {
+            if !rule.matches_stage(
+                meta,
+                &info,
+                evaluated.as_ref().map(|_| answer_ips.as_slice()),
+            ) {
                 continue;
             }
             match &rule.action {
@@ -416,9 +422,52 @@ impl DnsService {
                     self.record_reverse(&raw, false);
                     return Ok(raw);
                 }
-                Action::Evaluate | Action::Respond => {
-                    crate::logging::warn(format_args!(
-                        "dns: evaluate/respond actions are a known gap; rule ignored"
+                Action::Evaluate {
+                    server,
+                    rewrite_ttl,
+                    disable_cache,
+                } => {
+                    let tag = if server.is_empty() {
+                        &self.final_tag
+                    } else {
+                        server
+                    };
+                    let cfg = self.servers.get(tag).ok_or_else(|| {
+                        std::io::Error::other(format!("dns: evaluate server missing: {tag}"))
+                    })?;
+                    if cfg.is_fakeip() && !allow_fakeip {
+                        continue;
+                    }
+                    let mut eval_opts = opts.clone();
+                    if rewrite_ttl.is_some() {
+                        eval_opts.rewrite_ttl = *rewrite_ttl;
+                    }
+                    eval_opts.disable_cache |= *disable_cache;
+                    let ttl = eval_opts.rewrite_ttl;
+                    let raw = self
+                        .exchange_target(
+                            meta,
+                            query,
+                            allow_fakeip,
+                            skip_cache_read,
+                            Arc::clone(cfg),
+                            eval_opts,
+                        )
+                        .await?;
+                    let raw = match ttl {
+                        Some(ttl) => codec::rewrite_ttl(&raw, ttl)?,
+                        None => raw,
+                    };
+                    answer_ips = codec::answer_ips(&raw)?;
+                    evaluated = Some((raw, cfg.is_fakeip()));
+                }
+                Action::Respond => {
+                    if let Some((raw, fakeip)) = &evaluated {
+                        self.record_reverse(raw, *fakeip);
+                        return codec::set_id(raw, info.id);
+                    }
+                    return Err(std::io::Error::other(
+                        "dns: respond without evaluated response",
                     ));
                 }
             }
@@ -431,6 +480,24 @@ impl DnsService {
                     .ok_or_else(|| std::io::Error::other("dns: final server missing"))?,
             ),
         };
+        let fakeip = target.is_fakeip();
+        let raw = self
+            .exchange_target(meta, query, allow_fakeip, skip_cache_read, target, opts)
+            .await?;
+        self.record_reverse(&raw, fakeip);
+        Ok(raw)
+    }
+
+    async fn exchange_target(
+        self: &Arc<Self>,
+        meta: &QueryMeta,
+        query: &[u8],
+        allow_fakeip: bool,
+        skip_cache_read: bool,
+        target: Arc<ServerConfig>,
+        opts: WalkOptions,
+    ) -> std::io::Result<Vec<u8>> {
+        let (query_msg, info) = codec::parse_query(query)?;
 
         // the hosts and local transports answer without touching the wire
         match target.kind {
@@ -445,7 +512,6 @@ impl DnsService {
                 }
                 let raw = codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
                     .map_err(std::io::Error::other)?;
-                self.record_reverse(&raw, target.is_fakeip());
                 return codec::set_id(&raw, info.id);
             }
             Kind::Local | Kind::Dhcp | Kind::Resolved => {
@@ -453,7 +519,6 @@ impl DnsService {
                     && let Some(mdns_result) = self.local_zone_mdns(query).await
                 {
                     let raw = mdns_result?;
-                    self.record_reverse(&raw, target.is_fakeip());
                     return codec::set_id(&raw, info.id);
                 }
                 let addrs = match self.neighbor_lookup(&target, &info.name) {
@@ -465,7 +530,6 @@ impl DnsService {
                 }
                 let raw = codec::synth_addresses(&query_msg, &addrs, codec::DEFAULT_TTL)
                     .map_err(std::io::Error::other)?;
-                self.record_reverse(&raw, target.is_fakeip());
                 return codec::set_id(&raw, info.id);
             }
             _ => {}
@@ -476,7 +540,6 @@ impl DnsService {
             let service: Arc<DnsService> = Arc::clone(self);
             let members: Arc<dyn group::Members> = service;
             let raw = group.exchange(members, query).await?;
-            self.record_reverse(&raw, target.is_fakeip());
             return codec::set_id(&raw, info.id);
         }
 
@@ -545,9 +608,7 @@ impl DnsService {
             Some(ttl) => codec::rewrite_ttl(&response, ttl)?.into(),
             None => response.into(),
         };
-        // one reverse-map write per wire answer, here; the fakeip target has
-        // its own store and was answered above.
-        self.record_reverse(&rewritten, target.is_fakeip());
+        // Reverse mapping is recorded only when the walk returns this answer.
 
         if use_cache && let Ok(meta_resp) = codec::response_meta(&rewritten) {
             let cacheable = matches!(
@@ -1108,6 +1169,205 @@ pub(crate) async fn system_lookup(host: &str) -> Vec<std::net::IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn response_walk_routes_rulesets_and_responds_to_bypass() {
+        use serde_json::json;
+        let evaluate = json!({"action":"evaluate", "server":"real"});
+        let bypass = json!({"type":"logical", "mode":"and", "action":"respond", "rules":[
+            {"source_ip_cidr":"192.0.2.0/24", "domain":"probe.example"},
+            {"match_response":true, "ip_cidr":["198.18.0.0/15", "fc00::/18"], "invert":true}
+        ]});
+        let route_fake = json!({"action":"route", "server":"fake"});
+        for (rules, ip, source, expected) in [
+            (
+                vec![
+                    evaluate.clone(),
+                    json!({"match_response":true,"rule_set":"addresses","action":"route","server":"fake"}),
+                ],
+                "203.0.113.7",
+                "192.0.2.2",
+                "198.18.",
+            ),
+            (
+                vec![
+                    evaluate.clone(),
+                    json!({"match_response":true,"rule_set":"addresses","action":"route","server":"fake"}),
+                ],
+                "192.0.2.7",
+                "192.0.2.2",
+                "192.0.2.7",
+            ),
+            (
+                vec![evaluate.clone(), bypass.clone(), route_fake.clone()],
+                "203.0.113.7",
+                "192.0.2.2",
+                "203.0.113.7",
+            ),
+            (
+                vec![evaluate.clone(), bypass.clone(), route_fake.clone()],
+                "203.0.113.7",
+                "192.0.3.2",
+                "198.18.",
+            ),
+            (
+                vec![evaluate.clone(), bypass.clone(), route_fake.clone()],
+                "198.18.0.99",
+                "192.0.2.2",
+                "198.18.0.2",
+            ),
+            (
+                vec![evaluate.clone(), bypass.clone(), route_fake.clone()],
+                "2001:db8::7",
+                "192.0.2.2",
+                "2001:db8::7",
+            ),
+            (
+                vec![evaluate.clone(), bypass.clone(), route_fake.clone()],
+                "fc00::99",
+                "192.0.2.2",
+                "fc00::",
+            ),
+            (
+                vec![route_fake.clone(), evaluate.clone(), bypass.clone()],
+                "203.0.113.7",
+                "192.0.2.2",
+                "198.18.",
+            ),
+        ] {
+            let root = json!({"route":{"rule_set":[{"type":"inline", "tag":"addresses", "rules":[{"ip_cidr":"203.0.113.0/24"}]}]},
+                "dns":{"servers":[{"type":"hosts", "tag":"real", "path":[], "predefined":{"probe.example":[ip]}},
+                    {"type":"fakeip","tag":"fake","inet4_range":"198.18.0.0/15","inet6_range":"fc00::/18"}],
+                    "rules":rules, "final":"real"}});
+            let svc = Arc::new(DnsService::build(&root).unwrap().unwrap());
+            let meta = QueryMeta {
+                source: Some(source.parse().unwrap()),
+                ..Default::default()
+            };
+            for id in [123, 456] {
+                let qtype = if ip.contains(':') {
+                    RecordType::AAAA
+                } else {
+                    RecordType::A
+                };
+                let query = codec::build_query(id, "probe.example", qtype).unwrap();
+                let raw = svc.exchange(&meta, &query, true).await.unwrap();
+                assert_eq!(codec::parse_message(&raw).unwrap().id, id);
+                assert!(
+                    codec::answer_ips(&raw).unwrap()[0]
+                        .to_string()
+                        .starts_with(expected),
+                    "{rules:?} {ip} {source}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn respond_without_evaluation_fails() {
+        let root = serde_json::json!({"dns":{"servers":[{"type":"local","tag":"l"}],
+            "rules":[{"action":"respond"}], "final":"l"}});
+        let svc = Arc::new(DnsService::build(&root).unwrap().unwrap());
+        let query = codec::build_query(1, "probe.example", RecordType::A).unwrap();
+        assert!(
+            svc.exchange(&QueryMeta::default(), &query, true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("without evaluated response")
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluated_fakeip_response_keeps_its_own_reverse_mapping() {
+        let root = serde_json::json!({"dns":{
+            "servers":[{"type":"fakeip","tag":"fake","inet4_range":"198.18.0.0/15"}],
+            "rules":[{"action":"evaluate","server":"fake"},{"action":"respond"}],
+            "final":"fake", "reverse_mapping":true
+        }});
+        let svc = Arc::new(DnsService::build(&root).unwrap().unwrap());
+        let query = codec::build_query(1, "probe.example", RecordType::A).unwrap();
+        let raw = svc
+            .exchange(&QueryMeta::default(), &query, true)
+            .await
+            .unwrap();
+        let ip = codec::answer_ips(&raw).unwrap()[0];
+        assert!(ip.to_string().starts_with("198.18."));
+        assert_eq!(svc.reverse_domain(ip), None);
+    }
+
+    #[tokio::test]
+    async fn evaluated_wire_response_uses_cache_options_and_preserves_id() {
+        use serde_json::json;
+        for disable_cache in [false, true] {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = count.clone();
+            let responder = tokio::spawn(async move {
+                let mut buf = [0; 512];
+                loop {
+                    let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let (message, _) = codec::parse_query(&buf[..n]).unwrap();
+                    let raw =
+                        codec::synth_addresses(&message, &["203.0.113.7".parse().unwrap()], 60)
+                            .unwrap();
+                    socket.send_to(&raw, peer).await.unwrap();
+                }
+            });
+            let svc = Arc::new(DnsService::build(&json!({"dns":{
+                "servers":[{"type":"udp","tag":"real","server":"127.0.0.1","server_port":port}],
+                "rules":[{"action":"evaluate","server":"real","disable_cache":disable_cache,"rewrite_ttl":42},
+                    {"action":"respond"}], "final":"real"
+            }})).unwrap().unwrap());
+            for id in [123, 456] {
+                let query = codec::build_query(id, "probe.example", RecordType::A).unwrap();
+                let raw = svc
+                    .exchange(&QueryMeta::default(), &query, true)
+                    .await
+                    .unwrap();
+                let response = codec::parse_message(&raw).unwrap();
+                assert_eq!(response.id, id);
+                assert_eq!(response.answers[0].ttl, 42);
+                assert_eq!(
+                    codec::answer_ips(&raw).unwrap(),
+                    vec!["203.0.113.7".parse::<std::net::IpAddr>().unwrap()]
+                );
+            }
+            assert_eq!(
+                count.load(std::sync::atomic::Ordering::SeqCst),
+                if disable_cache { 2 } else { 1 }
+            );
+            responder.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluation_is_query_local_and_latest_answer_wins() {
+        let root = serde_json::json!({"dns":{
+            "servers":[{"type":"hosts","tag":"first","path":[],"predefined":{"probe.example":["203.0.113.7"]}},
+                {"type":"hosts","tag":"second","path":[],"predefined":{"probe.example":["192.0.2.7"]}}],
+            "rules":[{"domain":"probe.example","action":"evaluate","server":"first"},
+                {"domain":"probe.example","action":"evaluate","server":"second"}, {"action":"respond"}], "final":"first"
+        }});
+        let svc = Arc::new(DnsService::build(&root).unwrap().unwrap());
+        let query = codec::build_query(1, "probe.example", RecordType::A).unwrap();
+        let raw = svc
+            .exchange(&QueryMeta::default(), &query, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            codec::answer_ips(&raw).unwrap(),
+            vec!["192.0.2.7".parse::<std::net::IpAddr>().unwrap()]
+        );
+        let other = codec::build_query(2, "other.example", RecordType::A).unwrap();
+        assert!(
+            svc.exchange(&QueryMeta::default(), &other, true)
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn strategy_parse() {
