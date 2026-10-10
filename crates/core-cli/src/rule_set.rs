@@ -256,18 +256,104 @@ fn cmd_rule_set_decompile(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_rule_set_match(args: &[String]) -> Result<(), String> {
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("Usage: sing-box rule-set match [flags] [rule-set-path]");
-        return Ok(());
+#[derive(Debug)]
+struct MatchArgs {
+    source: String,
+    format: Option<String>,
+    domain: Option<String>,
+    ip: Option<String>,
+}
+
+fn parse_match_args(args: &[String]) -> Result<MatchArgs, String> {
+    let mut positional = Vec::new();
+    let mut format = None;
+    let mut domain = None;
+    let mut ip = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            positional.extend_from_slice(&args[index + 1..]);
+            break;
+        }
+        let (name, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(n, v)| (n, Some(v)));
+        let slot = match name {
+            "-f" | "--format" => Some(&mut format),
+            "-d" | "--domain" => Some(&mut domain),
+            "-i" | "--ip" => Some(&mut ip),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            let value = if let Some(value) = inline {
+                value.to_string()
+            } else {
+                index += 1;
+                args.get(index)
+                    .filter(|v| !v.starts_with('-'))
+                    .cloned()
+                    .ok_or_else(|| format!("rule-set match: missing value for {name}"))?
+            };
+            if value.is_empty() {
+                return Err(format!("rule-set match: missing value for {name}"));
+            }
+            *slot = Some(value);
+        } else if arg.starts_with('-') && arg != "-" {
+            return Err(format!("rule-set match: unknown flag {arg}"));
+        } else {
+            positional.push(arg.clone());
+        }
+        index += 1;
     }
-    let positional = positional_args(args);
+    if let Some(value) = &format {
+        if value != "binary" && value != "source" {
+            return Err(format!("rule-set match: unknown rule-set format: {value}"));
+        }
+    }
     let source = positional
         .first()
-        .ok_or("rule-set match: missing [rule-set-path]")?
-        .clone();
-    let data = read_input(&source)?;
-    let rules = if data.starts_with(b"SRS") {
+        .cloned()
+        .ok_or("rule-set match: missing [rule-set-path]")?;
+    if domain.is_some() || ip.is_some() {
+        if positional.len() != 1 {
+            return Err(
+                "rule-set match: cannot combine positional query with --domain or --ip".into(),
+            );
+        }
+    } else {
+        if positional.len() != 2 {
+            return Err("rule-set match: expected [rule-set-path] [IP address/domain]".into());
+        }
+        let query = positional[1].clone();
+        if query.parse::<std::net::IpAddr>().is_ok() {
+            ip = Some(query);
+        } else {
+            domain = Some(query);
+        }
+    }
+    Ok(MatchArgs {
+        source,
+        format,
+        domain,
+        ip,
+    })
+}
+
+fn cmd_rule_set_match(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!(
+            "Usage: sing-box rule-set match [-f source|binary] [rule-set-path] [IP address/domain]"
+        );
+        return Ok(());
+    }
+    let parsed = parse_match_args(args)?;
+    let data = read_input(&parsed.source)?;
+    let binary = parsed
+        .format
+        .as_deref()
+        .map_or(data.starts_with(b"SRS"), |f| f == "binary");
+    let rules = if binary {
         core_config::srs::read(&data)?
     } else {
         let text =
@@ -280,14 +366,9 @@ fn cmd_rule_set_match(args: &[String]) -> Result<(), String> {
             .cloned()
             .unwrap_or_default()
     };
-    let domain = flag_value(args, "-d", "--domain");
-    let ip = flag_value(args, "-i", "--ip");
-    if domain.is_none() && ip.is_none() {
-        return Err("rule-set match: one of --domain or --ip is required".to_string());
-    }
     let mut hits = 0usize;
     for (index, rule) in rules.iter().enumerate() {
-        if rule_matches(rule, domain.as_deref(), ip.as_deref()) {
+        if rule_matches(rule, parsed.domain.as_deref(), parsed.ip.as_deref()) {
             println!("[{index}] match");
             hits += 1;
         }
@@ -512,6 +593,98 @@ pub fn cmd_rule_set(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn match_accepts_forkop_format_and_positional_query() {
+        for values in [
+            vec![
+                "--format",
+                "binary",
+                "list.srs",
+                "forkop-validation.invalid",
+            ],
+            vec!["list.srs", "forkop-validation.invalid", "-f", "binary"],
+            vec!["--format=binary", "list.srs", "forkop-validation.invalid"],
+            vec!["-f=binary", "list.srs", "forkop-validation.invalid"],
+        ] {
+            let parsed = parse_match_args(&args(&values)).unwrap();
+            assert_eq!(parsed.source, "list.srs");
+            assert_eq!(parsed.format.as_deref(), Some("binary"));
+            assert_eq!(parsed.domain.as_deref(), Some("forkop-validation.invalid"));
+            assert!(parsed.ip.is_none());
+        }
+        for address in ["192.0.2.1", "2001:db8::1"] {
+            let parsed = parse_match_args(&args(&["list.srs", address])).unwrap();
+            assert_eq!(parsed.ip.as_deref(), Some(address));
+            assert!(parsed.domain.is_none());
+        }
+        let legacy = parse_match_args(&args(&["list.srs", "--domain", "example.com"])).unwrap();
+        assert_eq!(legacy.domain.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn match_rejects_invalid_arguments() {
+        for values in [
+            vec!["--format"],
+            vec!["--format", "--domain", "example.com", "list.srs"],
+            vec!["--format=", "list.srs", "example.com"],
+            vec!["--format", "invalid", "list.srs", "example.com"],
+            vec!["list.srs"],
+            vec!["list.srs", "example.com", "extra"],
+            vec!["list.srs", "example.com", "--domain", "example.com"],
+            vec!["--unknown", "list.srs", "example.com"],
+        ] {
+            assert!(parse_match_args(&args(&values)).is_err(), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn forkop_preflight_accepts_valid_srs_without_match_and_rejects_corruption() {
+        let directory = std::env::temp_dir().join(format!("rust-x-match-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        // No extension: Forkop stages downloads as source-N, so explicit format matters.
+        let path = directory.join("source-1");
+        let value = serde_json::json!({"version": 3, "rules": [
+            {"domain": ["example.com"]}, {"ip_cidr": ["192.0.2.0/24", "2001:db8::/32"]}
+        ]});
+        std::fs::write(&path, core_config::srs::compile(&value, 3).unwrap()).unwrap();
+        let path = path.to_str().unwrap();
+        for query in [
+            "forkop-validation.invalid",
+            "example.com",
+            "192.0.2.1",
+            "2001:db8::1",
+        ] {
+            cmd_rule_set_match(&args(&["--format", "binary", path, query])).unwrap();
+        }
+        let rules = value["rules"].as_array().unwrap();
+        assert!(rule_matches(&rules[0], Some("example.com"), None));
+        assert!(!rule_matches(
+            &rules[0],
+            Some("forkop-validation.invalid"),
+            None
+        ));
+        assert!(rule_matches(&rules[1], None, Some("2001:db8::1")));
+        assert!(!rule_matches(&rules[1], None, Some("198.51.100.1")));
+        std::fs::write(path, b"SRS\x03broken").unwrap();
+        assert!(
+            cmd_rule_set_match(&args(&[
+                "--format",
+                "binary",
+                path,
+                "forkop-validation.invalid"
+            ]))
+            .is_err()
+        );
+        std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(cmd_rule_set_match(&args(&["--format", "binary", path, "example.com"])).is_err());
+        cmd_rule_set_match(&args(&["--format", "source", path, "example.com"])).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn test_positional_args_flag_ordering() {
