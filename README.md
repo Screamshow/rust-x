@@ -11,7 +11,3 @@ Rust X — независимый форк [tachyon-core](https://github.com/Dus
 ## 📜 Лицензия
 
 **[GPL-3.0-only](LICENSE)**, унаследована от sing-box и sing-box-lx. `tachyon-core` — независимая разработка сообщества Tachyon, не аффилированная с SagerNet или Leadaxe. Авторские права на протоколы и спецификации sing-box принадлежат их законным авторам.
-
-<p align="center">
-  <img src="assets/readme/footer_tachyon.svg" width="100%" alt="Tachyon Community Footer" />
-</p>
