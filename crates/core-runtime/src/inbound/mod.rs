@@ -14,23 +14,30 @@ use crate::logging;
 use crate::outbound::shadowsocks::stream::{SsReader, SsWriter};
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
+#[cfg(feature = "legacy-protocols")]
 pub mod anytls;
 pub mod direct;
+#[cfg(feature = "legacy-protocols")]
 pub mod fptn;
 pub mod hysteria2;
 pub mod mixed;
 pub mod mux;
+#[cfg(feature = "legacy-protocols")]
 pub mod naive;
 pub mod proxy;
 pub mod redirect;
+#[cfg(feature = "legacy-protocols")]
 pub mod shadowsocks;
+#[cfg(feature = "legacy-protocols")]
 pub mod shadowtls;
 pub mod tls;
 pub mod tproxy;
 pub(crate) mod transport;
+#[cfg(feature = "legacy-protocols")]
 pub mod tuic;
 pub mod tun;
 pub(crate) mod udp;
+#[cfg(feature = "legacy-protocols")]
 pub mod vmess;
 
 #[cfg(target_os = "linux")]
@@ -42,15 +49,36 @@ mod relay;
 /// and hand both ends to the kernel (`splice`) instead of copying.
 pub trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any {
     fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any> ProxyStream for T {
     fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
 }
 pub type AnyStream = Box<dyn ProxyStream>;
 pub type AnyRead = Box<dyn AsyncRead + Send + Unpin>;
 pub type AnyWrite = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// Vision's peer can stop outer TLS encryption independently of our writes.
+/// Switch only the read side, preserving bytes already buffered by TLS.
+pub(crate) fn enable_vision_direct_read(stream: &mut AnyStream) -> bool {
+    let stream = (**stream).as_any_mut();
+    if let Some(alpn) = stream.downcast_mut::<AlpnStream>() {
+        return enable_vision_direct_read(&mut alpn.inner);
+    }
+    if let Some(vless) = stream.downcast_mut::<crate::outbound::secure::VlessStream>() {
+        return vless.enable_vision_direct_read();
+    }
+    if let Some(tls) = stream.downcast_mut::<crate::tls_utls::FingerprintStream<TcpStream>>() {
+        tls.enable_direct_read();
+        return true;
+    }
+    false
+}
 
 /// A stream carrying its negotiated ALPN protocol from the TLS handshake.
 pub struct AlpnStream {

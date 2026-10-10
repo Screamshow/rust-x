@@ -8,6 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
+# Optional upstream protocol set; Rust X omits it by default.
+legacy-protocols = []
 default = ["full"]
 full = ["brotli", "regex"]
 

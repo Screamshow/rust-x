@@ -16,11 +16,7 @@ static GLOBAL: allocstat::Counting = allocstat::Counting;
 #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
 mod allocstat;
 
-#[cfg(all(
-    target_os = "linux",
-    not(target_env = "msvc"),
-    target_arch = "x86_64"
-))]
+#[cfg(all(target_os = "linux", not(target_env = "msvc"), target_arch = "x86_64"))]
 unsafe extern "C" {
     fn mi_option_set(option: std::ffi::c_int, value: std::ffi::c_long);
 }

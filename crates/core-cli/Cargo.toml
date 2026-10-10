@@ -12,6 +12,7 @@ name = "tachyon-core"
 path = "src/main.rs"
 
 [features]
+legacy-protocols = ["core-runtime/legacy-protocols", "core-config/legacy-protocols"]
 default = ["full"]
 full = [
     "core-config/full",
