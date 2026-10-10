@@ -1,7 +1,7 @@
 # Rust X
 
 Rust X — независимый форк [tachyon-core](https://github.com/Dushnilin/tachyon-core)
-для Forkop. Это не официальная сборка Tachyon; проект не аффилирован с его
+для Forkop X. Это не официальная сборка Tachyon; проект не аффилирован с его
 разработчиками. Лицензия GPL-3.0-only и авторство upstream сохранены.
 
 Изменения upstream перенесены выборочно; сокращённый
