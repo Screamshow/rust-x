@@ -86,10 +86,8 @@ rustflags = [
 # symlinks on a Linux one; rust-lld with the self-contained CRT is the only
 # combination that links everywhere.
 #
-# x86-64-v3 (AVX2 era) so the autovectorized bulk loops get the wide units;
-# the crypto crates stay on runtime detection either way. A CPU older than
-# Haswell / Excavator (pre-2013, some atoms) will SIGILL on these binaries --
-# build a plain x86-64 one for those.
+# Generic x86-64 release baseline. Crypto implementations can still use
+# runtime feature detection without making AVX2 mandatory for the package.
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "target-cpu=x86-64", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]

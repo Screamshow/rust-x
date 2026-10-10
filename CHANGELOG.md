@@ -9,8 +9,8 @@ All notable changes to tachyon-core. The version is the workspace version in
 - Fixed connected UDP DNS exchanges and DNS rule-set match fallthrough.
 - Added focused DNS regression tests and independent XHTTP compatibility coverage.
 - Preserved the existing reduced profile, Vision receive fix and TLS fingerprints.
-- Prepared release metadata for Rust X 0.0.2; APK signing and VM validation of
-  the final release packages remain release gates.
+- Prepared release metadata and a single finalization command that signs APKs
+  on the existing mirror, verifies hashes, and publishes verified draft assets.
 
 ## 0.0.1
 

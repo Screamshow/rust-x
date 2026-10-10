@@ -171,12 +171,13 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: Rust X ${{ steps.notes.outputs.version }}
-          # APKs are signed on the mirror host after the build. Keep artifacts
-          # in a draft until final signatures, hashes and package checks pass.
+          # scripts/finalize_release.py signs on the existing mirror and
+          # publishes only after signature and checksum verification.
           draft: true
           body_path: notes.md
           files: |
             artifacts/*.apk
             artifacts/*.ipk
             artifacts/SHA256SUMS
+            artifacts/openwrt-manifest.json
           fail_on_unmatched_files: false
