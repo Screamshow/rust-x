@@ -144,7 +144,7 @@ jobs:
       - name: One checksum file for everything
         run: |
           cd artifacts
-          cat ./*.sha256 > SHA256SUMS
+          sha256sum ./*.apk ./*.ipk > SHA256SUMS
           rm -f ./*.sha256
           cat SHA256SUMS
       - name: The notes for this version, not the whole file
@@ -169,9 +169,7 @@ jobs:
           name: Rust X ${{ steps.notes.outputs.version }}
           body_path: notes.md
           files: |
-            artifacts/*.tar.gz
             artifacts/*.apk
             artifacts/*.ipk
-            artifacts/openwrt-manifest.json
             artifacts/SHA256SUMS
           fail_on_unmatched_files: false

@@ -12,18 +12,17 @@ baseline while reporting Rust X identity separately. This baseline does not
 claim every Sing-Box feature or protocol. Existing configuration is retained;
 the included procd service is disabled by default on fresh installations.
 
-APK assets are signed with the existing Forkop mirror key. The release includes
-`forkop-apk.pem`; routers must trust this public key in `/etc/apk/keys/`
+APK assets are signed with the existing Forkop mirror key. The public key is at https://mirror.51343.ru/forkop/forkop-apk.pem;
+routers must trust this public key in `/etc/apk/keys/`
 (existing mirror installations already use it). Installation does not require
 `--allow-untrusted`. These release assets are not a package feed. Existing Forkop
 defaults, component selectors and mirror update policy are unchanged.
 
 `scripts/package_openwrt.py` validates ELF machine identity and produces
 both formats, hashes and `openwrt-manifest.json`. The separate packaging
-workflow can attach packages to an existing binary release; future core
+workflow retains packaging outputs as internal build artifacts; future core
 releases package both formats automatically. The original 0.0.1 core tag
-remains unchanged; `openwrt-packaging-source.tar.gz` supplies the added
-packaging source from main.
+remains unchanged; the packaging source is available on main.
 
 Unsigned build outputs are signed on the mirror using `scripts/sign_openwrt.py`
 with the mirror's existing APK tool, private key path and published public key.
