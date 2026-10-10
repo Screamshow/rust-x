@@ -17,6 +17,53 @@ const KEY_PEM: &str = include_str!("../../../tests/golden/certs/localhost.key");
 const ROUTER_MAIN: &str = include_str!("../../../tests/golden/live/router-main.json");
 
 #[tokio::test]
+async fn remote_ruleset_is_shared_with_dns_after_fetch() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = [0; 2048];
+        stream.read(&mut buf).await.unwrap();
+        let body = r#"{"version":1,"rules":[{"domain_suffix":["remote.example"]}]}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let root = json!({"outbounds":[{"type":"direct","tag":"direct"}],
+        "route":{"final":"direct","rule_set":[{"type":"remote","tag":"remote","format":"source",
+            "url":format!("http://{addr}/rules.json"),"download_detour":"direct"}]},
+        "dns":{"servers":[{"type":"fakeip","tag":"fake","inet4_range":"198.18.0.0/15"},
+            {"type":"hosts","tag":"real","path":[],"predefined":{"remote.example":["203.0.113.7"],"updated.example":["203.0.113.8"]}}],
+            "rules":[{"rule_set":"remote","action":"route","server":"fake"}],"final":"real"}});
+    let instance = core_runtime::start(&root).await.unwrap();
+    server.await.unwrap();
+    let dns = instance.dns().unwrap();
+    let query = core_runtime::dns::codec::build_query(
+        123,
+        "remote.example",
+        hickory_proto::rr::RecordType::A,
+    )
+    .unwrap();
+    let raw = dns
+        .exchange(&QueryMeta::default(), &query, true)
+        .await
+        .unwrap();
+    assert!(
+        core_runtime::dns::codec::answer_ips(&raw).unwrap()[0]
+            .to_string()
+            .starts_with("198.18.")
+    );
+    instance.shutdown();
+}
+
+#[tokio::test]
 async fn udp_dns_connected_socket_with_and_without_router() {
     let (addr, hits) = spawn_udp_dns(Ipv4Addr::new(203, 0, 113, 7)).await;
     let router = core_runtime::route::Router::new(&json!({

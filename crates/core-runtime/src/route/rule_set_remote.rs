@@ -538,7 +538,11 @@ impl RemoteRegistry {
                 logging::warn(format_args!(
                     "{error}: starting with an empty rule-set, retrying in the background"
                 ));
-                spawn_recovery(Arc::clone(set), Arc::clone(router), cache.cloned());
+                router.track_background_task(spawn_recovery(
+                    Arc::clone(set),
+                    Arc::clone(router),
+                    cache.cloned(),
+                ));
             }
         }
         Ok(())
@@ -560,7 +564,8 @@ impl RemoteRegistry {
                     DEFAULT_UPDATE_INTERVAL
                 }
             };
-            tokio::spawn(async move {
+            let owner = Arc::clone(&router);
+            let task = tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.tick().await;
                 loop {
@@ -571,6 +576,7 @@ impl RemoteRegistry {
                     }
                 }
             });
+            owner.track_background_task(task);
         }
     }
 }
@@ -581,7 +587,7 @@ fn spawn_recovery(
     set: Arc<Mutex<RemoteRuleSet>>,
     router: Arc<Router>,
     cache: Option<SharedCacheFile>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         for delay in RECOVERY_LADDER {
             tokio::time::sleep(delay).await;
@@ -603,7 +609,7 @@ fn spawn_recovery(
             "rule-set {} is still empty, the periodic updater will keep trying",
             set.lock().await.tag()
         ));
-    });
+    })
 }
 
 /// `ruleSet.Read` for a downloaded payload: the pinned `format` wins, then the

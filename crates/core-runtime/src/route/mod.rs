@@ -753,6 +753,13 @@ impl Router {
     pub fn take_probe_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
         std::mem::take(&mut *self.probe_tasks.lock().expect("probe tasks"))
     }
+
+    pub(crate) fn track_background_task(&self, task: tokio::task::JoinHandle<()>) {
+        self.probe_tasks
+            .lock()
+            .expect("background tasks")
+            .push(task);
+    }
 }
 
 impl Router {

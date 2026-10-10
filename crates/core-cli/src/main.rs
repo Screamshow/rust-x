@@ -235,7 +235,9 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
     .map_err(|e| format!("run: {e}"))?;
     runtime
-        .block_on(async { core_runtime::run_str(&raw).await })
+        .block_on(async {
+            core_runtime::run_with_loader(|| load_config(args).map_err(anyhow::Error::msg)).await
+        })
         .map_err(|e| format!("run: {e:#}"))
 }
 

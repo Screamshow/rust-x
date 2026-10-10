@@ -122,10 +122,33 @@ impl BoxInstance {
             task.abort();
         }
     }
+
+    /// Wait until aborted listener tasks have released their sockets.
+    pub async fn shutdown_wait(self) {
+        stop_tasks(self.tasks).await;
+    }
+}
+
+async fn stop_tasks(tasks: Vec<JoinHandle<()>>) {
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
 }
 
 /// Build and start the data plane from a parsed configuration document.
 pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
+    let mut tasks = Vec::new();
+    let result = start_inner(root, &mut tasks).await;
+    if result.is_err() {
+        stop_tasks(tasks).await;
+    }
+    result
+}
+
+async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::Result<BoxInstance> {
     core_tls::install_default_provider();
     warn_unhonored_options(root);
     let log = root.get("log");
@@ -167,19 +190,21 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     let router = Router::new(root)?;
     // remote rule sets fetch before the instance is up: a failed first fetch
     // aborts the start, exactly like `RemoteRuleSet.StartContext`
-    router
+    let remote_result = router
         .rule_sets()
         .start_remote(&router, cache_file.clone())
-        .await?;
+        .await;
+    tasks.extend(router.take_probe_tasks());
+    remote_result?;
     router.start_endpoints().await?;
-    let dns_service = dns::DnsService::build(root).context("dns section")?;
+    let dns_service = dns::DnsService::build_with_rule_sets(root, Some(router.rule_sets()))
+        .context("dns section")?;
     if let Some(service) = &dns_service {
         // `dns.server.detour` dials through the outbounds
         service.set_router(Arc::clone(&router));
     }
     dns::set_service(dns_service.clone());
 
-    let mut tasks = Vec::new();
     tasks.extend(router.take_probe_tasks());
     #[allow(unused_mut)]
     let mut clash_api = None;
@@ -349,7 +374,7 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     }
 
     Ok(BoxInstance {
-        tasks,
+        tasks: std::mem::take(tasks),
         inbounds,
         dns: dns_service,
         clash_api,
@@ -359,34 +384,90 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
 
 /// Load a configuration file, run the box, and block until SIGINT/SIGTERM.
 pub async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(config_path)
-        .with_context(|| format!("read config {}", config_path.display()))?;
-    run_str(&raw).await
+    run_with_loader(|| {
+        std::fs::read_to_string(config_path)
+            .with_context(|| format!("read config {}", config_path.display()))
+    })
+    .await
 }
 
 /// Run the box from raw JSON configuration string, and block until SIGINT/SIGTERM.
 pub async fn run_str(raw: &str) -> anyhow::Result<()> {
-    let root: Value = serde_json::from_str(raw).with_context(|| "decode config".to_string())?;
-    let instance = start(&root).await?;
-    wait_for_signal().await;
-    logging::info(format_args!("shutting down"));
-    instance.shutdown();
-    Ok(())
+    run_with_loader(|| Ok(raw.to_string())).await
 }
 
-async fn wait_for_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+fn checked_config(raw: &str) -> anyhow::Result<Value> {
+    core_config::check_str(raw).map_err(anyhow::Error::msg)?;
+    serde_json::from_str(raw).context("decode config")
+}
+
+async fn reload_instance(
+    instance: BoxInstance,
+    previous: &Value,
+    next: &Value,
+) -> anyhow::Result<(BoxInstance, bool)> {
+    instance.shutdown_wait().await;
+    match start(next).await {
+        Ok(instance) => Ok((instance, true)),
+        Err(error) => {
+            logging::warn(format_args!(
+                "reload failed, restoring previous configuration: {error:#}"
+            ));
+            let restored = start(previous)
+                .await
+                .context("restore previous configuration after reload failure")?;
+            Ok((restored, false))
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Reload the original CLI configuration sources on SIGHUP.
+pub async fn run_with_loader(
+    mut load: impl FnMut() -> anyhow::Result<String>,
+) -> anyhow::Result<()> {
+    // Register HUP before startup, including potentially slow remote downloads.
+    #[cfg(unix)]
+    let (mut term, mut hup) = {
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::hangup())?,
+        )
+    };
+    let mut root = checked_config(&load()?)?;
+    let mut instance = start(&root).await?;
+    loop {
+        #[cfg(unix)]
+        let reload = tokio::select! {
+            _ = tokio::signal::ctrl_c() => false,
+            _ = term.recv() => false,
+            _ = hup.recv() => true,
+        };
+        #[cfg(not(unix))]
+        let reload = {
+            tokio::signal::ctrl_c().await?;
+            false
+        };
+        if !reload {
+            logging::info(format_args!("shutting down"));
+            instance.shutdown_wait().await;
+            return Ok(());
+        }
+        let next = match load().and_then(|raw| checked_config(&raw)) {
+            Ok(next) => next,
+            Err(error) => {
+                logging::warn(format_args!(
+                    "reload configuration rejected; keeping current runtime: {error:#}"
+                ));
+                continue;
+            }
+        };
+        let (reloaded, accepted) = reload_instance(instance, &root, &next).await?;
+        instance = reloaded;
+        if accepted {
+            root = next;
+            logging::info(format_args!("configuration reloaded after SIGHUP"));
+        }
     }
 }
 
@@ -429,6 +510,64 @@ fn netns_from_config(value: &Value) -> anyhow::Result<Vec<netns::Namespace>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    async fn socks_ready(port: u16) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream.write_all(&[5, 1, 0]).await.unwrap();
+        let mut response = [0; 2];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_exact(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response, [5, 0]);
+    }
+
+    #[tokio::test]
+    async fn reload_rebinds_same_port_and_recovers_partial_start_failure() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let old = json!({"inbounds":[{"type":"mixed","tag":"old","listen":"127.0.0.1","listen_port":port}],
+            "outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}});
+        let instance = start(&old).await.unwrap();
+        socks_ready(port).await;
+        let mut next = old.clone();
+        next["inbounds"][0]["tag"] = json!("new");
+        let (instance, accepted) = reload_instance(instance, &old, &next).await.unwrap();
+        assert!(accepted);
+        assert_eq!(instance.inbound_addrs()[0].0, "new");
+        socks_ready(port).await;
+        let busy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut broken = next.clone();
+        broken["inbounds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"mixed","tag":"busy",
+            "listen":"127.0.0.1","listen_port":busy.local_addr().unwrap().port()}));
+        let (instance, accepted) = reload_instance(instance, &next, &broken).await.unwrap();
+        assert!(!accepted);
+        assert_eq!(instance.inbound_addrs().len(), 1);
+        assert_eq!(instance.inbound_addrs()[0].0, "new");
+        socks_ready(port).await;
+        instance.shutdown_wait().await;
+        assert!(
+            tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn reload_validation_rejects_bad_configuration() {
+        assert!(checked_config("{broken").is_err());
+        assert!(checked_config(r#"{"inbounds":[{"type":"unknown"}]}"#).is_err());
+    }
 
     #[test]
     fn options_we_accept_but_do_not_apply_are_named() {

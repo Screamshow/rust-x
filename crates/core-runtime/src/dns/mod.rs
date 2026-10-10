@@ -113,6 +113,13 @@ impl DnsService {
 
     /// Build from the root document; `Ok(None)` when there is no `dns` section.
     pub fn build(root: &Value) -> anyhow::Result<Option<Arc<Self>>> {
+        Self::build_with_rule_sets(root, None)
+    }
+
+    pub(crate) fn build_with_rule_sets(
+        root: &Value,
+        shared: Option<&crate::route::rule_set::RuleSetRegistry>,
+    ) -> anyhow::Result<Option<Arc<Self>>> {
         let Some(dns) = root.get("dns") else {
             return Ok(None);
         };
@@ -149,10 +156,17 @@ impl DnsService {
             .get("route")
             .and_then(Value::as_object)
             .unwrap_or(&empty_route);
-        let rule_sets = crate::route::build_rule_sets(
-            route,
-            &crate::http_client::Registry::from_config(root)?,
-        )?;
+        let owned;
+        let rule_sets = match shared {
+            Some(registry) => registry,
+            None => {
+                owned = crate::route::build_rule_sets(
+                    route,
+                    &crate::http_client::Registry::from_config(root)?,
+                )?;
+                &owned
+            }
+        };
         for (i, obj) in map
             .get("rules")
             .and_then(Value::as_array)
