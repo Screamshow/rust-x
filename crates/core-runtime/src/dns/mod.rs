@@ -181,7 +181,7 @@ impl DnsService {
             .enumerate()
         {
             let at = format!("dns.rules[{i}]");
-            rules.push(Rule::build_with_rule_sets(obj, &at, &rule_sets)?);
+            rules.push(Rule::build_with_rule_sets(obj, &at, rule_sets)?);
         }
 
         let final_tag = match map.get("final").and_then(Value::as_str) {

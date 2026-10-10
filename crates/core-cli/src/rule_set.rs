@@ -306,10 +306,11 @@ fn parse_match_args(args: &[String]) -> Result<MatchArgs, String> {
         }
         index += 1;
     }
-    if let Some(value) = &format {
-        if value != "binary" && value != "source" {
-            return Err(format!("rule-set match: unknown rule-set format: {value}"));
-        }
+    if let Some(value) = &format
+        && value != "binary"
+        && value != "source"
+    {
+        return Err(format!("rule-set match: unknown rule-set format: {value}"));
     }
     let source = positional
         .first()

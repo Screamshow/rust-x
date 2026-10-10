@@ -142,7 +142,7 @@ async fn tproxy_udp_forwards_repeated_datagrams_and_releases_session_sockets() {
         "route": {"rules": [{"inbound": "test", "action": "route",
             "outbound": "direct", "override_port": echo.port()}]}
     });
-    let mut instance = core_runtime::start(&config).await.expect("start tproxy");
+    let instance = core_runtime::start(&config).await.expect("start tproxy");
     let addr = inbound_addr(&instance, "test");
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
     let mut buf = [0u8; 2048];
@@ -190,7 +190,7 @@ async fn tproxy_receive_only_media_keeps_the_client_receive_pump_alive() {
         "route":{"rules":[{"inbound":"test", "action":"route", "outbound":"direct",
             "override_port":server.local_addr().expect("server addr").port()}]}
     });
-    let mut instance = core_runtime::start(&config).await.expect("start tproxy");
+    let instance = core_runtime::start(&config).await.expect("start tproxy");
     let addr = inbound_addr(&instance, "test");
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client");
     client.send_to(b"start", addr).await.expect("first send");

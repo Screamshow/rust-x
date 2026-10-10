@@ -692,11 +692,11 @@ async fn shutdown_frees_the_listeners_for_the_next_start() {
         json!({"final": "out"}),
     );
 
-    let mut first = start_box(cfg.clone()).await;
+    let first = start_box(cfg.clone()).await;
     assert_eq!(inbound_addr(&first, "mixed-in").port(), port);
     first.shutdown_wait().await;
 
-    let mut second = start_box(cfg).await;
+    let second = start_box(cfg).await;
     assert_eq!(
         inbound_addr(&second, "mixed-in").port(),
         port,

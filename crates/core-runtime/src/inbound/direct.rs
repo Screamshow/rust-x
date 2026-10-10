@@ -165,10 +165,6 @@ impl Direct {
             .unwrap_or_else(|| Err(io::Error::other("direct inbound: no listener")))
     }
 
-    pub(crate) fn shutdown_socket(&self) -> Option<std::sync::Weak<UdpSocket>> {
-        self.udp.as_ref().map(Arc::downgrade)
-    }
-
     pub async fn serve(self) {
         let Self {
             listener,

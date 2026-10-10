@@ -23,7 +23,16 @@ async fn remote_ruleset_is_shared_with_dns_after_fetch() {
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut buf = [0; 2048];
-        stream.read(&mut buf).await.unwrap();
+        let mut used = 0;
+        loop {
+            assert!(used < buf.len(), "HTTP request headers exceed test buffer");
+            let count = stream.read(&mut buf[used..]).await.unwrap();
+            assert!(count > 0, "HTTP request ended before headers were complete");
+            used += count;
+            if buf[..used].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                break;
+            }
+        }
         let body = r#"{"version":1,"rules":[{"domain_suffix":["remote.example"]}]}"#;
         stream
             .write_all(
