@@ -1,5 +1,9 @@
 # Rust X protocol profile
 
+Supported release platforms: OpenWrt x86_64 and aarch64_cortex-a53 only.
+CI tests run on Linux; both release targets use static musl binaries.
+Other platform code inherited from upstream is not a supported build target.
+
 Firefox/Safari and Chrome for XHTTP now use our Sing-Box X 1.0.3 captures.
 See [the uTLS refresh report](RUST-X-UTLS-2026-10-10.md).
 

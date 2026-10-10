@@ -5,10 +5,10 @@ on:
     branches: [main]
   pull_request:
 
-# A new push to the same PR makes the previous run obsolete; don't queue behind it.
+# New commits supersede earlier CI runs on the same branch or PR.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -19,38 +19,20 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
+    name: Test (Linux)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # The workspace .cargo/config.toml pins a local MSVC path; runners resolve
-      # `link.exe` from PATH themselves.
-      - name: Build (override local MSVC linker pin)
-        if: runner.os == 'Windows'
-        run: cargo build --workspace
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: link.exe
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --features legacy-protocols -- -D warnings
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: ${{ runner.os == 'Windows' && 'link.exe' || '' }}
       - run: cargo test -p core-config --test rust_x_profile
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: ${{ runner.os == 'Windows' && 'link.exe' || '' }}
       - run: cargo test --workspace --features legacy-protocols
-        env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: ${{ runner.os == 'Windows' && 'link.exe' || '' }}
       # The exit gate needs CAP_NET_ADMIN (tproxy); re-run it as root so CI
       # covers what the unprivileged `cargo test` above can only skip.
       - name: Exit gate (privileged)
-        if: runner.os == 'Linux'
         run: |
           sudo -E env "PATH=$PATH" cargo test -p core-runtime --features legacy-protocols --test exit_gate -- --nocapture
           sudo -E env "PATH=$PATH" cargo test -p core-runtime --features legacy-protocols --test inbounds -- --nocapture
@@ -85,47 +67,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # One architecture per OpenWrt family, and x86_64 because it is the only
-          # one whose binary the runner can actually execute. `release.yml` builds
-          # all seven on a tag; this job is the per-push smoke test, and paying for
-          # seven builds plus seven artifacts on every commit is not a smoke test.
           - target: x86_64-unknown-linux-musl
           - target: aarch64-unknown-linux-musl
-          - target: armv7-unknown-linux-musleabihf
-          # tier-3, no prebuilt std: the standard library is built from source
-          - target: mipsel-unknown-linux-musl
-            build-std: true
     steps:
       - uses: actions/checkout@v4
-      # `rustup target add` refuses a tier-3 target outright -- there are no
-      # prebuilt artifacts to add, and it says so and exits non-zero -- so the
-      # MIPS entry must not be asked to install its target. It gets nightly plus
-      # rust-src and lets `-Z build-std` compile the standard library.
-      - name: Toolchain (prebuilt std)
-        if: ${{ !matrix.build-std }}
-        uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           targets: ${{ matrix.target }}
-      - name: Toolchain (std from source)
-        if: ${{ matrix.build-std }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
-          components: rust-src
-      # The toolchains are static musl: link with the bundled rust-lld and the
-      # self-contained CRT objects instead of a host gcc that is not there.
-      # Not set for aarch64 at all: cargo takes rustflags from exactly one
-      # place, and this env would win over the `[target.aarch64-*]` array in
-      # .cargo/config.toml, dropping its `--cfg aes_armv8`/`polyval_armv8`/
-      # `chacha20_force_neon` -- the cfgs that turn the RustCrypto ARMv8
-      # assembly on. Without them the router builds software AES-GCM (0.03
-      # GiB/s against 0.22 measured on a Cortex-A55), while the config alone
-      # already carries linker=rust-lld and link-self-contained=yes.
-      - name: Link musl with rust-lld
-        if: ${{ matrix.target != 'aarch64-unknown-linux-musl' }}
-        run: |
-          echo "RUSTFLAGS=-C linker=rust-lld -C link-self-contained=yes" >> "$GITHUB_ENV"
+      # Preserve the target-specific crypto and static linker flags in Cargo config.
       - name: C compiler for x86_64 musl mimalloc
         if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
         run: |
@@ -133,13 +82,7 @@ jobs:
           sudo apt-get install -y musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
-        run: |
-          if [ -n "${{ matrix.build-std }}" ]; then
-            cargo build --workspace --release --target ${{ matrix.target }} \
-              -Z build-std=std,panic_abort
-          else
-            cargo build --workspace --release --target ${{ matrix.target }}
-          fi
+        run: cargo build --locked --workspace --release --target ${{ matrix.target }}
       - name: Size budget (<= 12 MiB)
         run: |
           size=$(stat -c%s "target/${{ matrix.target }}/release/tachyon-core")
