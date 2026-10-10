@@ -3,6 +3,16 @@
 All notable changes to tachyon-core. The version is the workspace version in
 `Cargo.toml`; a tag that disagrees with it is refused by the release workflow.
 
+## 0.0.5
+
+- Fixed rule-set match command compatibility with Forkop updates
+- Improved compound rule-set matching and index consistency
+- Fixed XHTTP connection reuse and VLESS XUDP framing
+- Improved UDP sessions and inbound socket recovery
+- Added DNS server-address caching with per-host request coordination
+- Preserved successful DNS answers when the other address family fails
+- Added focused regression tests and verified behavior on OpenWrt
+
 ## 0.0.4
 
 - Accept single IPv4/IPv6 addresses in DNS source_ip_cidr and ip_cidr rules.
