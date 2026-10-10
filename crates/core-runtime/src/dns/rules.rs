@@ -144,7 +144,7 @@ impl Rule {
         let source_ip_cidr = string_list(map, "source_ip_cidr", at)?
             .into_iter()
             .map(|raw| {
-                super::transport::IpPrefix::parse(&raw)
+                parse_rule_prefix(&raw)
                     .map_err(|e| anyhow::anyhow!("{at}: bad source_ip_cidr {raw:?}: {e}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -220,7 +220,7 @@ impl Rule {
             ip_cidr: string_list(map, "ip_cidr", at)?
                 .into_iter()
                 .map(|raw| {
-                    super::transport::IpPrefix::parse(&raw)
+                    parse_rule_prefix(&raw)
                         .map_err(|e| anyhow::anyhow!("{at}: bad ip_cidr {raw:?}: {e}"))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?,
@@ -532,6 +532,15 @@ fn domain_suffix_match(name: &str, suffix: &str) -> bool {
     name == suffix || name.ends_with(&format!(".{suffix}"))
 }
 
+fn parse_rule_prefix(raw: &str) -> anyhow::Result<super::transport::IpPrefix> {
+    if raw.contains('/') {
+        return super::transport::IpPrefix::parse(raw);
+    }
+    let addr: IpAddr = raw.parse()?;
+    let bits = if addr.is_ipv4() { 32 } else { 128 };
+    super::transport::IpPrefix::parse(&format!("{addr}/{bits}"))
+}
+
 fn string_list(
     map: &serde_json::Map<String, Value>,
     key: &str,
@@ -554,6 +563,58 @@ fn string_list(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bare_rule_addresses_match_only_the_host() {
+        for (address, other, bits) in [
+            ("192.168.90.239", "192.168.90.238", 32),
+            ("2001:db8::239", "2001:db8::238", 128),
+        ] {
+            let host: IpAddr = address.parse().unwrap();
+            let other: IpAddr = other.parse().unwrap();
+            assert_eq!(
+                parse_rule_prefix(address).unwrap(),
+                parse_rule_prefix(&format!("{address}/{bits}")).unwrap()
+            );
+            let source = Rule::build(&json!({"source_ip_cidr":address}), "rule").unwrap();
+            let query = info("probe.example", RecordType::A);
+            assert!(source.matches(
+                &QueryMeta {
+                    source: Some(host),
+                    ..Default::default()
+                },
+                &query
+            ));
+            assert!(!source.matches(
+                &QueryMeta {
+                    source: Some(other),
+                    ..Default::default()
+                },
+                &query
+            ));
+            let response =
+                Rule::build(&json!({"match_response":true,"ip_cidr":address}), "rule").unwrap();
+            assert!(response.matches_stage(&QueryMeta::default(), &query, Some(&[host])));
+            assert!(!response.matches_stage(&QueryMeta::default(), &query, Some(&[other])));
+        }
+    }
+
+    #[test]
+    fn rule_addresses_reject_invalid_hosts_and_prefixes() {
+        for address in [
+            "invalid",
+            "192.0.2.256",
+            "192.0.2.1/33",
+            "2001:db8::1/129",
+            "192.0.2.1/",
+        ] {
+            for field in ["source_ip_cidr", "ip_cidr"] {
+                let mut rule = json!({});
+                rule[field] = json!(address);
+                assert!(Rule::build(&rule, "rule").is_err());
+            }
+        }
+    }
+
     #[test]
     fn response_predicates_nested_invert_and_missing_response() {
         let rule = Rule::build(&serde_json::json!({
