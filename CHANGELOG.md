@@ -5,6 +5,23 @@ All notable changes to tachyon-core. The version is the workspace version in
 
 ## 0.0.1
 
+First Rust X release for Forkop, based on Tachyon 0.0.1.
+
+- Reduced default protocol profile; omitted protocols remain behind the optional
+  legacy-protocols source feature. SOCKS5/HTTP mixed inbound for DirectProxy stays.
+- Forkop XHTTP configuration compatibility and Vision Direct receive-path fix.
+- Firefox 148, Safari 26.3 and Chrome fingerprints captured from Sing-Box X 1.0.3.
+- Native TLS certificate compression: zlib, Brotli and Zstd, with length checks.
+- TUN/AF_ALG Clippy cleanup and documented integration checks.
+
+The primary OpenWrt 25 VM passed all 42 subscription group-entry HTTPS checks;
+Firefox/Safari TCP/REALITY and gRPC, and Chrome on both XHTTP nodes were tested.
+See docs/RUST-X.md and docs/RUST-X-UTLS-2026-10-10.md for scope and limitations.
+
+Assets are standalone binaries, not OpenWrt APK/IPK packages. SHA256SUMS covers
+release archives. Upstream licenses and source history are retained.
+## Upstream Tachyon 0.0.1
+
 The first tagged build. A routing core for OpenWrt: the client stack end to
 end, plus the server half of the four TCP proxy protocols.
 

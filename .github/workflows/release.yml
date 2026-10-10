@@ -5,7 +5,7 @@ name: Release
 # that disagrees with it is a release whose binary lies about what it is.
 on:
   push:
-    tags: ["v*"]
+    tags: ["rust-x-v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -25,13 +25,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Read the version the binaries will report
         id: version
         run: |
           in_cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           tag="${{ inputs.tag || github.ref_name }}"
           echo "cargo=$in_cargo tag=$tag" >> "$GITHUB_OUTPUT"
-          if [ "$in_cargo" != "${tag#v}" ]; then
+          if [ "$in_cargo" != "${tag#rust-x-v}" ]; then
             echo "::error::Cargo.toml says $in_cargo, the release is tagged $tag"
             exit 1
           fi
@@ -95,6 +97,8 @@ jobs:
             budget: 16777216
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Toolchain (prebuilt std)
         if: ${{ !matrix.build-std }}
@@ -129,7 +133,7 @@ jobs:
             cargo build --workspace --release --target ${{ matrix.target }} \
               -Z build-std=std,panic_abort
           else
-            cargo build --workspace --release --target ${{ matrix.target }}
+            cargo build --locked --workspace --release --target ${{ matrix.target }}
           fi
 
       - name: Size budget
@@ -156,31 +160,33 @@ jobs:
         shell: bash
         run: |
           ver="${{ inputs.tag || github.ref_name }}"
-          name="tachyon-core-${{ matrix.name }}-${ver}"
+          name="rust-x-${{ matrix.name }}-${ver#rust-x-}"
           bin="target/${{ matrix.target }}/release/tachyon-core"
           cp "$bin" "./${name}"
-          sha256sum "./${name}" > "./${name}.sha256"
+
           tar -czf "${name}.tar.gz" "./${name}"
+          shasum -a 256 "${name}.tar.gz" > "${name}.sha256"
 
       - name: Pack (Windows)
         if: ${{ matrix.is_windows }}
         shell: bash
         run: |
           ver="${{ inputs.tag || github.ref_name }}"
-          name="tachyon-core-${{ matrix.name }}-${ver}"
+          name="rust-x-${{ matrix.name }}-${ver#rust-x-}"
           bin="target/${{ matrix.target }}/release/tachyon-core.exe"
           cp "$bin" "./tachyon-core.exe"
-          sha256sum "./tachyon-core.exe" > "./${name}.sha256"
+
           tar -czf "${name}.tar.gz" "./tachyon-core.exe"
           powershell -Command "Compress-Archive -Path './tachyon-core.exe' -DestinationPath '${name}.zip'"
+          sha256sum "${name}.tar.gz" "${name}.zip" > "${name}.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.name }}
           path: |
-            tachyon-core-${{ matrix.name }}-*.tar.gz
-            tachyon-core-${{ matrix.name }}-*.zip
-            tachyon-core-${{ matrix.name }}-*.sha256
+            rust-x-${{ matrix.name }}-*.tar.gz
+            rust-x-${{ matrix.name }}-*.zip
+            rust-x-${{ matrix.name }}-*.sha256
           if-no-files-found: warn
 
   release:
@@ -191,6 +197,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -204,7 +212,7 @@ jobs:
       - name: The notes for this version, not the whole file
         run: |
           ver="${{ inputs.tag || github.ref_name }}"
-          ver="${ver#v}"
+          ver="${ver#rust-x-v}"
           awk -v want="## $ver" '
             /^## / { inside = ($0 == want) }
             inside
@@ -218,6 +226,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Rust X ${{ inputs.tag || github.ref_name }}
           body_path: notes.md
           files: |
             artifacts/*.tar.gz
