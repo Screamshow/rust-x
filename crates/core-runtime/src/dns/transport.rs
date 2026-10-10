@@ -296,6 +296,28 @@ impl FakeIpStore {
         }
     }
 
+    pub fn prefixes(&self) -> (Option<IpPrefix>, Option<IpPrefix>) {
+        (self.v4, self.v6)
+    }
+
+    /// Migrate active FakeIP state from an earlier pool if the prefixes match.
+    pub fn migrate_from(&self, old: &FakeIpStore) {
+        if self.prefixes() != old.prefixes() {
+            return;
+        }
+        let old_state = old.state.lock().expect("old fakeip state");
+        let mut new_state = self.state.lock().expect("new fakeip state");
+        new_state.cur4 = old_state.cur4;
+        new_state.cur6 = old_state.cur6;
+        new_state.addr_to_domain = old_state.addr_to_domain.clone();
+        for (d, ip) in old_state.domain_to_v4.iter() {
+            new_state.domain_to_v4.put(d.clone(), *ip);
+        }
+        for (d, ip) in old_state.domain_to_v6.iter() {
+            new_state.domain_to_v6.put(d.clone(), *ip);
+        }
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         self.v4.is_some_and(|p| p.contains(ip)) || self.v6.is_some_and(|p| p.contains(ip))
     }
@@ -809,19 +831,41 @@ async fn exchange_udp(
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
     let socket = dialer.udp(cfg, addr).await?;
-    // Direct and proxied DNS sockets are connected to their actual peer (which
-    // may be a local relay rather than addr). Preserve that peer on send.
-    match socket.send(query).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotConnected => {
-            socket.send_to(query, addr).await?;
+    let send_query = || async {
+        match socket.send(query).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(107) || e.raw_os_error() == Some(10057) => {
+                socket.send_to(query, addr).await.map(|_| ())
+            }
+            Err(e) => Err(e),
         }
-        Err(error) => return Err(error),
-    }
+    };
+    send_query().await?;
+
     let mut buf = vec![0u8; 65535];
-    let n = socket.recv(&mut buf).await?;
-    buf.truncate(n);
-    Ok(buf)
+    let retransmit_interval = Duration::from_millis(1500);
+    loop {
+        let recv_fut = async {
+            match socket.recv(&mut buf).await {
+                Ok(n) => Ok(n),
+                Err(e) if e.raw_os_error() == Some(107) || e.raw_os_error() == Some(10057) => {
+                    let (n, _from) = socket.recv_from(&mut buf).await?;
+                    Ok(n)
+                }
+                Err(e) => Err(e),
+            }
+        };
+        match tokio::time::timeout(retransmit_interval, recv_fut).await {
+            Ok(Ok(n)) => {
+                buf.truncate(n);
+                return Ok(buf);
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                let _ = send_query().await;
+            }
+        }
+    }
 }
 
 async fn exchange_stream(

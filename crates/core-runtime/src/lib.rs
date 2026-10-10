@@ -33,6 +33,7 @@ use crate::route::Router;
 
 /// A started box instance: running inbound listeners plus their tasks.
 pub struct BoxInstance {
+    router: Arc<Router>,
     tasks: Vec<JoinHandle<()>>,
     inbounds: Vec<(String, SocketAddr)>,
     dns: Option<Arc<dns::DnsService>>,
@@ -116,16 +117,82 @@ impl BoxInstance {
         self.clash_api
     }
 
+    /// Running router instance.
+    pub fn router(&self) -> Arc<Router> {
+        Arc::clone(&self.router)
+    }
+
+    /// Perform in-place hot reload without stopping inbounds or dropping connections.
+    /// Perform in-place hot reload without stopping inbounds or dropping connections.
+    pub async fn reload_in_place(&mut self, new_root: &Value) -> anyhow::Result<()> {
+        warn_unhonored_options(new_root);
+
+        // 1. Build and validate new router inner BEFORE mutating anything running
+        let prepared = Router::prepare(new_root)?;
+        let new_inner = prepared.inner();
+
+        // 2. Build and validate new DNS service BEFORE mutating anything running
+        let new_dns = dns::DnsService::build_with_rule_sets(new_root, Some(new_inner.rule_sets()))
+            .context("dns section")?;
+
+        // Prepare downloads and endpoints before changing the live router.
+        let ready = async {
+            prepared
+                .rule_sets()
+                .start_remote(&prepared, self.cache_file.clone())
+                .await?;
+            prepared.start_endpoints().await?;
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(error) = ready {
+            stop_tasks(prepared.take_probe_tasks()).await;
+            return Err(error);
+        }
+        // Remote updater tasks remain tracked on the prepared inner.
+
+        // 3. Migrate active DNS cache, server addrs, reverse mappings, and fakeip pools
+        if let (Some(new_svc), Some(old_svc)) = (&new_dns, &self.dns) {
+            new_svc.migrate_from(old_svc);
+        }
+
+        // 4. Atomically apply the new router inner (delay history, selectors, and urltest preserved)
+        self.router.apply_prepared_inner(new_inner).await?;
+
+        // 5. Connect DNS service to the shared router and publish globally
+        if let Some(service) = &new_dns {
+            service.set_router(Arc::clone(&self.router));
+        }
+        dns::set_service(new_dns.clone());
+        self.dns = new_dns;
+
+        // 7. Hot-apply log settings
+        let log = new_root.get("log");
+        let level = log.and_then(|l| l.get("level")).and_then(Value::as_str);
+        let disabled = log
+            .and_then(|l| l.get("disabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(lvl) = level {
+            logging::set_level(lvl);
+        }
+        logging::set_enabled(!disabled);
+
+        Ok(())
+    }
+
     /// Abort all listeners and connection tasks.
     pub fn shutdown(self) {
-        for task in self.tasks {
+        for task in self.tasks.into_iter().chain(self.router.take_probe_tasks()) {
             task.abort();
         }
     }
 
     /// Wait until aborted listener tasks have released their sockets.
     pub async fn shutdown_wait(self) {
-        stop_tasks(self.tasks).await;
+        let mut tasks = self.tasks;
+        tasks.extend(self.router.take_probe_tasks());
+        stop_tasks(tasks).await;
     }
 }
 
@@ -197,7 +264,7 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
     tasks.extend(router.take_probe_tasks());
     remote_result?;
     router.start_endpoints().await?;
-    let dns_service = dns::DnsService::build_with_rule_sets(root, Some(router.rule_sets()))
+    let dns_service = dns::DnsService::build_with_rule_sets(root, Some(&router.rule_sets()))
         .context("dns section")?;
     if let Some(service) = &dns_service {
         // `dns.server.detour` dials through the outbounds
@@ -374,6 +441,7 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
     }
 
     Ok(BoxInstance {
+        router,
         tasks: std::mem::take(tasks),
         inbounds,
         dns: dns_service,
@@ -421,6 +489,29 @@ async fn reload_instance(
     }
 }
 
+pub fn can_reload_in_place(old_root: &Value, new_root: &Value) -> bool {
+    if old_root.get("inbounds") != new_root.get("inbounds") {
+        return false;
+    }
+    let old_clash = old_root
+        .get("experimental")
+        .and_then(|e| e.get("clash_api"));
+    let new_clash = new_root
+        .get("experimental")
+        .and_then(|e| e.get("clash_api"));
+    if old_clash != new_clash {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    if old_root.get("network_namespaces") != new_root.get("network_namespaces") {
+        return false;
+    }
+    if old_root.get("ntp") != new_root.get("ntp") {
+        return false;
+    }
+    true
+}
+
 /// Reload the original CLI configuration sources on SIGHUP.
 pub async fn run_with_loader(
     mut load: impl FnMut() -> anyhow::Result<String>,
@@ -462,6 +553,13 @@ pub async fn run_with_loader(
                 continue;
             }
         };
+        if can_reload_in_place(&root, &next) {
+            match instance.reload_in_place(&next).await {
+                Ok(()) => root = next,
+                Err(error) => logging::warn(format_args!("hot reload failed: {error:#}")),
+            }
+            continue;
+        }
         let (reloaded, accepted) = reload_instance(instance, &root, &next).await?;
         instance = reloaded;
         if accepted {
