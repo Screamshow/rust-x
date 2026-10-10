@@ -80,7 +80,7 @@ impl Direct {
                         }
                     };
                     let chosen = udp_sock.local_addr()?.port();
-                    match TcpListener::bind(SocketAddr::new(ip, chosen)).await {
+                    match super::bind_tcp(SocketAddr::new(ip, chosen)) {
                         Ok(tcp) => {
                             bound = Some((Some(tcp), Some(Arc::new(udp_sock))));
                             break;
@@ -101,7 +101,7 @@ impl Direct {
             }
             _ => {
                 let listener = if want_tcp {
-                    Some(TcpListener::bind(SocketAddr::new(ip, port)).await?)
+                    Some(super::bind_tcp(SocketAddr::new(ip, port))?)
                 } else {
                     None
                 };
@@ -110,9 +110,7 @@ impl Direct {
                     None => port,
                 };
                 let udp = if want_udp {
-                    Some(Arc::new(
-                        UdpSocket::bind(SocketAddr::new(ip, bound_port)).await?,
-                    ))
+                    Some(Arc::new(super::bind_udp(SocketAddr::new(ip, bound_port))?))
                 } else {
                     None
                 };
@@ -167,6 +165,10 @@ impl Direct {
             .unwrap_or_else(|| Err(io::Error::other("direct inbound: no listener")))
     }
 
+    pub(crate) fn shutdown_socket(&self) -> Option<std::sync::Weak<UdpSocket>> {
+        self.udp.as_ref().map(Arc::downgrade)
+    }
+
     pub async fn serve(self) {
         let Self {
             listener,
@@ -200,8 +202,7 @@ impl Direct {
                         });
                     }
                     Err(err) => {
-                        logging::warn(format_args!("direct[{tcp_tag}] accept: {err}"));
-                        return;
+                        super::serve_stalled(&format!("direct[{tcp_tag}] accept"), &err).await;
                     }
                 }
             }
@@ -212,6 +213,8 @@ impl Direct {
                 return;
             };
             let hub = UdpHub::new(Arc::clone(&router), udp_timeout, DatagramFrame::Raw);
+            let _stop_hub = StopHub(Arc::clone(&hub));
+            let mut packets = tokio::task::JoinSet::new();
             let listen_addr = match sock.local_addr() {
                 Ok(a) => a,
                 Err(err) => {
@@ -221,7 +224,11 @@ impl Direct {
             };
             let mut buf = vec![0u8; 64 * 1024];
             loop {
-                match sock.recv_from(&mut buf).await {
+                let received = tokio::select! {
+                    packet = sock.recv_from(&mut buf) => packet,
+                    _ = packets.join_next(), if !packets.is_empty() => continue,
+                };
+                match received {
                     Ok((n, source)) => {
                         let dest = destination_for(&r#override, Some(listen_addr));
                         let Target::Ip(dest) = dest else {
@@ -231,10 +238,10 @@ impl Direct {
                             continue;
                         }
                         let hub = Arc::clone(&hub);
-                        let reply = Reply::Socket(Arc::clone(&sock));
+                        let reply = Reply::Socket(Arc::downgrade(&sock));
                         let tag = tag.clone();
                         let payload = buf[..n].to_vec();
-                        tokio::spawn(async move {
+                        packets.spawn(async move {
                             if let Err(err) = hub.handle(reply, source, dest, &payload, &tag).await
                             {
                                 logging::debug(format_args!("direct[{tag}] udp {source}: {err}"));
@@ -242,8 +249,7 @@ impl Direct {
                         });
                     }
                     Err(err) => {
-                        logging::warn(format_args!("direct[{tag}] udp recv: {err}"));
-                        return;
+                        super::serve_stalled(&format!("direct[{tag}] udp recv"), &err).await;
                     }
                 }
             }
@@ -252,6 +258,14 @@ impl Direct {
             _ = tcp => {}
             _ = udp_loop => {}
         }
+    }
+}
+
+struct StopHub(Arc<UdpHub>);
+
+impl Drop for StopHub {
+    fn drop(&mut self) {
+        self.0.stop();
     }
 }
 

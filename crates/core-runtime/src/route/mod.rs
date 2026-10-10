@@ -292,6 +292,42 @@ impl Outbound {
         }
     }
 
+    pub fn apply_dial_defaults(
+        &mut self,
+        default_mark: Option<u32>,
+        default_interface: Option<&str>,
+    ) {
+        let apply = |dial: &mut crate::outbound::dial::DialOptions| {
+            if dial.routing_mark.is_none() {
+                dial.routing_mark = default_mark;
+            }
+            if dial.bind_interface.is_none() {
+                dial.bind_interface = default_interface.map(str::to_string);
+            }
+        };
+
+        match self {
+            Outbound::Direct(d) => apply(&mut d.dial),
+            Outbound::Vless(v) => apply(&mut v.dial),
+            #[cfg(feature = "legacy-protocols")]
+            Outbound::Trojan(t) => apply(&mut t.dial),
+            #[cfg(feature = "legacy-protocols")]
+            Outbound::Shadowsocks(s) => apply(&mut s.dial),
+            #[cfg(feature = "legacy-protocols")]
+            Outbound::Vmess(m) => apply(&mut m.dial),
+            #[cfg(feature = "legacy-protocols")]
+            Outbound::Socks(s) => apply(&mut s.dial),
+            Outbound::Http(h) => apply(&mut h.dial),
+            #[cfg(feature = "legacy-protocols")]
+            Outbound::ShadowTls(s) => apply(&mut s.dial),
+            #[cfg(feature = "legacy-protocols")]
+            Outbound::Naive(n) => apply(&mut n.dial),
+            #[cfg(feature = "legacy-protocols")]
+            Outbound::Snell(s) => apply(&mut s.dial),
+            _ => {}
+        }
+    }
+
     fn build(obj: &Value, at: &str) -> anyhow::Result<Outbound> {
         let ty = obj
             .get("type")
@@ -846,14 +882,7 @@ impl Router {
                 tags.insert(tag, i);
             }
             let mut outbound = Outbound::build(obj, &format!("outbounds[{i}]"))?;
-            if let Outbound::Direct(direct) = &mut outbound {
-                if direct.dial.routing_mark.is_none() {
-                    direct.dial.routing_mark = defaults.default_mark;
-                }
-                if direct.dial.bind_interface.is_none() {
-                    direct.dial.bind_interface = bind_iface.clone();
-                }
-            }
+            outbound.apply_dial_defaults(defaults.default_mark, bind_iface.as_deref());
             outbounds.push(outbound);
         }
         let endpoints_list = root
@@ -1478,6 +1507,34 @@ mod tests {
             match router.outbounds.first() {
                 Some(Outbound::Direct(d)) => assert_eq!(d.dial.routing_mark, Some(99)),
                 _ => panic!("expected direct outbound"),
+            }
+        }
+
+        // Proxy sockets inherit defaults too; explicit values still win.
+        #[cfg(target_os = "linux")]
+        for explicit in [None, Some(99)] {
+            let mut outbound = json!({
+                "type": "vless", "tag": "v", "server": "127.0.0.1", "server_port": 443,
+                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
+            });
+            if let Some(mark) = explicit {
+                outbound["routing_mark"] = json!(mark);
+                outbound["bind_interface"] = json!("eth0");
+            }
+            let router = Router::new(&json!({
+                "outbounds": [outbound],
+                "route": {"final": "v", "default_mark": 7, "default_interface": "lo"}
+            }))
+            .unwrap();
+            match router.outbounds.first() {
+                Some(Outbound::Vless(v)) => {
+                    assert_eq!(v.dial.routing_mark, Some(explicit.unwrap_or(7)));
+                    assert_eq!(
+                        v.dial.bind_interface.as_deref(),
+                        Some(if explicit.is_some() { "eth0" } else { "lo" })
+                    );
+                }
+                _ => panic!("expected vless outbound"),
             }
         }
 

@@ -69,7 +69,7 @@ impl Mixed {
         let ip: IpAddr = host
             .parse()
             .map_err(|_| anyhow::anyhow!("{at}: invalid listen address {host:?}"))?;
-        let listener = TcpListener::bind(SocketAddr::new(ip, port)).await?;
+        let listener = super::bind_tcp(SocketAddr::new(ip, port))?;
         let users = obj
             .get("users")
             .and_then(Value::as_array)
@@ -129,8 +129,7 @@ impl Mixed {
                     });
                 }
                 Err(err) => {
-                    logging::warn(format_args!("mixed[{}] accept: {err}", self.tag));
-                    return;
+                    super::serve_stalled(&format!("mixed[{}] accept", self.tag), &err).await;
                 }
             }
         }
@@ -150,13 +149,8 @@ async fn handle_conn(
     stream.read_exact(&mut first).await?;
     match first[0] {
         0x05 if flavor != Flavor::Http => socks5(stream, peer, tag, users, router, udp).await,
-        #[cfg(feature = "legacy-protocols")]
         0x04 if flavor != Flavor::Http => socks4(stream, peer, tag, users, router).await,
-        #[cfg(not(feature = "legacy-protocols"))]
-        0x04 => Err(io::Error::other("SOCKS4/4a is excluded from Rust X")),
-        #[cfg(feature = "legacy-protocols")]
-        0x04 => Err(io::Error::other("socks request on an http inbound")),
-        0x05 => Err(io::Error::other("socks request on an http inbound")),
+        0x04 | 0x05 => Err(io::Error::other("socks request on an http inbound")),
         byte if flavor != Flavor::Socks => http(stream, byte, peer, tag, users, router).await,
         _ => Err(io::Error::other("not a socks request on a socks inbound")),
     }
@@ -167,7 +161,6 @@ async fn handle_conn(
 /// with 90 for granted and 91 for rejected, written once the upstream is up.
 /// With users configured the userid has to name a user whose password is empty,
 /// because SOCKS4 has nowhere to put one (the reference verifies `(userid, "")`).
-#[cfg(feature = "legacy-protocols")]
 async fn socks4(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -253,7 +246,6 @@ async fn socks4(
 
 /// A NUL-terminated field of a SOCKS4 request, without the NUL. Capped, because
 /// the peer controls how long it runs.
-#[cfg(feature = "legacy-protocols")]
 async fn read_cstring(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     const MAX: usize = 1024;
     let mut out = Vec::new();
@@ -487,7 +479,7 @@ async fn socks_udp_associate(
                             }
                             if let Err(err) = hub
                                 .handle(
-                                    Reply::Socket(Arc::clone(&relay)),
+                                    Reply::Socket(Arc::downgrade(&relay)),
                                     source,
                                     dest,
                                     &buf[offset..n],

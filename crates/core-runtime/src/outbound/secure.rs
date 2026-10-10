@@ -6,7 +6,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::mux;
-use crate::outbound::packet::{CMD_TCP, PacketEncoding, spawn_packet_bridge};
+use crate::outbound::packet::{CMD_MUX, CMD_TCP, PacketEncoding, spawn_packet_bridge};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::transport::Transport;
 use crate::tls_client::TlsOptions;
@@ -73,7 +73,7 @@ pub struct Vless {
     packet_encoding: PacketEncoding,
     /// Mux.Cool session pool; `None` when multiplexing is off
     mux: Option<Arc<mux::Client>>,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
 }
 
 impl Vless {
@@ -233,7 +233,10 @@ fn request_head(
     header.push(addons.len() as u8);
     header.extend_from_slice(&addons);
     header.push(command);
-    header.extend_from_slice(&encode_vless_target(target)?);
+    // Xray's Mux request ends at the command; XUDP names the destination.
+    if command != CMD_MUX {
+        header.extend_from_slice(&encode_vless_target(target)?);
+    }
     Ok(header)
 }
 
@@ -335,7 +338,7 @@ pub struct Trojan {
     password_hash: String,
     transport: Transport,
     tls: Option<TlsOptions>,
-    dial: crate::outbound::dial::DialOptions,
+    pub dial: crate::outbound::dial::DialOptions,
 }
 
 impl Trojan {
