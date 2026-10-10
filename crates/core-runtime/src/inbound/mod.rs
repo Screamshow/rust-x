@@ -416,6 +416,34 @@ fn reply_code_for_error(err: &io::Error) -> u8 {
     }
 }
 
+fn clash_host(ctx: &ConnContext) -> String {
+    match &ctx.destination {
+        Target::Ip(addr) => ctx.domain.clone().unwrap_or_else(|| addr.ip().to_string()),
+        Target::Domain(host, _) => host.clone(),
+    }
+}
+
+#[cfg(test)]
+mod monitoring_tests {
+    use super::*;
+
+    #[test]
+    fn monitor_uses_sniffed_domain_without_changing_dial_target() {
+        let mut ctx = ConnContext {
+            destination: Target::Ip("198.18.0.40:443".parse().unwrap()),
+            domain: Some("example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(clash_host(&ctx), "example.com");
+        assert_eq!(ctx.destination.to_string(), "198.18.0.40:443");
+        ctx.domain = None;
+        assert_eq!(clash_host(&ctx), "198.18.0.40");
+        ctx.destination = Target::Domain("mapped.example".into(), 443);
+        ctx.domain = Some("sniffed.example".into());
+        assert_eq!(clash_host(&ctx), "mapped.example");
+    }
+}
+
 /// Clash connection-view metadata for a routed connection: inbound, source,
 /// destination, matched rule and the outbound chain.
 pub fn clash_meta(
@@ -423,10 +451,7 @@ pub fn clash_meta(
     router: &Router,
     outbound_index: usize,
 ) -> clash_state::ConnMeta {
-    let host = match &ctx.destination {
-        Target::Ip(addr) => addr.ip().to_string(),
-        Target::Domain(host, _) => host.clone(),
-    };
+    let host = clash_host(ctx);
     let mut chains = Vec::new();
     let mut index = Some(outbound_index);
     // expand selector groups into their selected member (one level, like the

@@ -622,33 +622,11 @@ impl Rule {
         (kind.to_string(), payload, self.action().clash_view())
     }
 
-    /// Label used for a connection in `/connections`: the leading condition of
-    /// the payload, with the sing-box field name.
+    /// Preserve the complete matched rule for Forkop's connection monitor.
+    /// Splitting at the first '=' loses logical children and list conditions.
     pub fn clash_primary(&self) -> (String, String) {
-        let (kind, payload, _) = self.clash_view();
-        let field = payload
-            .split(['=', '['])
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let value = payload
-            .split_once('=')
-            .map(|(_, rest)| {
-                rest.trim()
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .split(' ')
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            })
-            .unwrap_or_default();
-        if field.is_empty() {
-            (kind, String::new())
-        } else {
-            (field, value)
-        }
+        let (_, payload, action) = self.clash_view();
+        (format!("{payload} => {action}"), String::new())
     }
 
     pub fn matches(&self, ctx: &ConnContext) -> bool {
@@ -1478,6 +1456,27 @@ mod tests {
             destination: super::super::Target::Domain(host.to_string(), port),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn connection_monitor_preserves_logical_rule_children() {
+        let rule = Rule::build(
+            &json!({
+                "type": "logical", "mode": "and", "outbound": "VPN-out",
+                "rules": [{"inbound": ["tproxy-in"]},
+                          {"domain_suffix": ["example.com", "example.org"]}]
+            }),
+            "r",
+            true,
+        )
+        .unwrap();
+        let (_, conditions, action) = rule.clash_view();
+        let (reported, payload) = rule.clash_primary();
+        assert_eq!(reported, format!("{conditions} => {action}"));
+        assert!(reported.contains("domain_suffix="));
+        assert!(reported.contains("example.org"));
+        assert!(reported.ends_with("=> route(VPN-out)"));
+        assert!(payload.is_empty());
     }
 
     #[test]
