@@ -34,6 +34,8 @@ const RESOLVE_TIMEOUT_GUARD: Duration = Duration::from_secs(10);
 /// The reference's `mdnsTimeout`: an mDNS answer is either already on the LAN
 /// or it is not coming.
 const MDNS_TIMEOUT: Duration = Duration::from_secs(1);
+const SERVER_ADDR_TTL: Duration = Duration::from_secs(60);
+type ServerAddrKey = (String, String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
@@ -79,6 +81,10 @@ pub struct DnsService {
     /// are purged on the next insert (the key itself owns an `Arc<str>`).
     inflight: std::sync::Mutex<HashMap<CacheKey, Weak<tokio::sync::Mutex<()>>>>,
     refreshing: std::sync::Mutex<HashSet<CacheKey>>,
+    /// Positive transport-address cache; ports are applied by each caller.
+    server_addrs: std::sync::Mutex<HashMap<ServerAddrKey, (IpAddr, Instant)>>,
+    /// Only concurrent lookups for the same resolver/host wait on each other.
+    server_addr_inflight: std::sync::Mutex<HashMap<ServerAddrKey, Weak<tokio::sync::Mutex<()>>>>,
     /// Installed after the router exists, so `detour` can dial through it.
     router: RwLock<Option<Arc<crate::route::Router>>>,
     /// `dns.reverse_mapping`: ip → domain learned from A/AAAA answers, present
@@ -263,6 +269,8 @@ impl DnsService {
             cache: RwLock::new(Cache::new(cache_capacity)),
             inflight: std::sync::Mutex::new(HashMap::new()),
             refreshing: std::sync::Mutex::new(HashSet::new()),
+            server_addrs: std::sync::Mutex::new(HashMap::new()),
+            server_addr_inflight: std::sync::Mutex::new(HashMap::new()),
             router: RwLock::new(None),
             reverse: reverse_mapping.then(|| RwLock::new(HashMap::new())),
             client_subnet,
@@ -772,6 +780,30 @@ impl DnsService {
         )
     }
 
+    fn cached_server_addr(&self, key: &ServerAddrKey) -> Option<IpAddr> {
+        self.server_addrs
+            .lock()
+            .ok()?
+            .get(key)
+            .copied()
+            .filter(|(_, at)| at.elapsed() < SERVER_ADDR_TTL)
+            .map(|(ip, _)| ip)
+    }
+
+    fn server_addr_lock(&self, key: &ServerAddrKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .server_addr_inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        locks.retain(|_, lock| lock.strong_count() != 0);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    }
+
     /// Resolve the transport's own address (domain servers via
     /// `domain_resolver`, otherwise the system resolver with a warning).
     ///
@@ -805,9 +837,27 @@ impl DnsService {
                         "dns: domain_resolver must not be a fakeip server",
                     ));
                 }
+                let key = (resolver_tag.clone(), cfg.server.clone());
+                if let Some(ip) = self.cached_server_addr(&key) {
+                    return Ok(SocketAddr::new(ip, cfg.port));
+                }
+                // Recursive resolver chains skip locking to avoid waiting on
+                // an ancestor's lock; the existing depth guard rejects cycles.
+                let lock = (depth == 0).then(|| self.server_addr_lock(&key));
+                let _guard = match &lock {
+                    Some(lock) => Some(lock.lock().await),
+                    None => None,
+                };
+                if let Some(ip) = self.cached_server_addr(&key) {
+                    return Ok(SocketAddr::new(ip, cfg.port));
+                }
                 let addrs = self.lookup_via(resolver, &cfg.server, depth + 1).await?;
                 let ip = pick_address(addrs, self.strategy)
                     .ok_or_else(|| std::io::Error::other("dns: no addresses resolved"))?;
+                if let Ok(mut cache) = self.server_addrs.lock() {
+                    cache.retain(|_, (_, at)| at.elapsed() < SERVER_ADDR_TTL);
+                    cache.insert(key, (ip, Instant::now()));
+                }
                 return Ok(SocketAddr::new(ip, cfg.port));
             }
             crate::logging::warn(format_args!(
@@ -894,13 +944,24 @@ impl DnsService {
         depth: u8,
     ) -> std::io::Result<Vec<IpAddr>> {
         let mut out = Vec::new();
+        let mut last_error = None;
         for qtype in self.strategy.query_types() {
-            let query = codec::build_query(rand_id(), host, *qtype)?;
-            let addr = self.resolve_server_addr(resolver, depth).await?;
-            let raw = transport::exchange(resolver, addr, &query, &self.dialer()).await?;
-            out.extend(codec::answer_ips(&raw)?);
+            let result = async {
+                let query = codec::build_query(rand_id(), host, *qtype)?;
+                let addr = self.resolve_server_addr(resolver, depth).await?;
+                let raw = transport::exchange(resolver, addr, &query, &self.dialer()).await?;
+                codec::answer_ips(&raw)
+            }
+            .await;
+            match result {
+                Ok(ips) => out.extend(ips),
+                Err(error) => last_error = Some(error),
+            }
         }
-        Ok(out)
+        match (out.is_empty(), last_error) {
+            (true, Some(error)) => Err(error),
+            _ => Ok(out),
+        }
     }
 
     /// `resolve` rule action with an explicit server tag: lookup bypasses the
@@ -1183,6 +1244,162 @@ pub(crate) async fn system_lookup(host: &str) -> Vec<std::net::IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn bootstrap_fixture(
+        fail: Option<RecordType>,
+        strategy: &str,
+    ) -> (
+        Arc<DnsService>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        let worker = tokio::spawn(async move {
+            let mut buf = vec![0; 4096];
+            loop {
+                let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let query = codec::parse_message(&buf[..n]).unwrap();
+                let qtype = query.queries[0].query_type();
+                let response = if fail == Some(qtype) {
+                    vec![0] // malformed response fails promptly, without a timeout
+                } else {
+                    codec::synth_address(
+                        &query,
+                        if qtype == RecordType::AAAA {
+                            "2001:db8::7"
+                        } else {
+                            "127.0.0.1"
+                        }
+                        .parse()
+                        .unwrap(),
+                        60,
+                    )
+                    .unwrap()
+                };
+                socket.send_to(&response, peer).await.unwrap();
+            }
+        });
+        let service = DnsService::build(&serde_json::json!({"dns": {
+            "strategy": strategy, "servers": [
+                {"type":"udp", "tag":"boot", "server":"127.0.0.1", "server_port":port},
+                {"type":"https", "tag":"doh", "server":"doh.invalid", "domain_resolver":"boot"}
+            ], "final":"boot"
+        }}))
+        .unwrap();
+        (service.unwrap(), count, worker)
+    }
+
+    #[tokio::test]
+    async fn bootstrap_singleflight_cache_expiry_and_port_independence() {
+        let (service, count, worker) = bootstrap_fixture(None, "ipv4_only").await;
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let service = service.clone();
+            tasks.spawn(async move {
+                service
+                    .resolve_server_addr(&service.servers["doh"], 0)
+                    .await
+                    .unwrap()
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(result.unwrap().ip(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        }
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut other_port = ServerConfig::build(&serde_json::json!({"type":"https","tag":"other","server":"doh.invalid","domain_resolver":"boot"}), "other").unwrap();
+        other_port.port = 8443;
+        assert_eq!(
+            service
+                .resolve_server_addr(&other_port, 0)
+                .await
+                .unwrap()
+                .port(),
+            8443
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let key = ("boot".into(), "doh.invalid".into());
+        service
+            .server_addrs
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .1 = Instant::now() - SERVER_ADDR_TTL;
+        service.resolve_server_addr(&other_port, 0).await.unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_different_hosts_do_not_share_a_lock_and_cycles_fail() {
+        let (service, _, worker) = bootstrap_fixture(None, "ipv4_only").await;
+        let key = ("boot".into(), "doh.invalid".into());
+        let lock = service.server_addr_lock(&key);
+        let guard = lock.lock().await;
+        let mut other = ServerConfig::build(&serde_json::json!({"type":"https","tag":"other","server":"doh.invalid","domain_resolver":"boot"}), "other").unwrap();
+        other.server = "other.invalid".into();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            service.resolve_server_addr(&other, 0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(guard);
+        worker.abort();
+        let cyclic = DnsService::build(&serde_json::json!({"dns": {"strategy":"ipv4_only",
+            "servers":[{"type":"udp","tag":"loop","server":"loop.invalid","domain_resolver":"loop"}], "final":"loop"
+        }})).unwrap().unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                cyclic.resolve_server_addr(&cyclic.servers["loop"], 0)
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_one_failed_family_preserves_the_other_without_fallback() {
+        for (failed, expected) in [
+            (RecordType::A, "2001:db8::7"),
+            (RecordType::AAAA, "127.0.0.1"),
+        ] {
+            let (service, count, worker) = bootstrap_fixture(Some(failed), "prefer_ipv4").await;
+            assert_eq!(
+                service
+                    .resolve_server_addr(&service.servers["doh"], 0)
+                    .await
+                    .unwrap()
+                    .ip(),
+                expected.parse::<IpAddr>().unwrap()
+            );
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+            worker.abort();
+        }
+        let (service, count, worker) = bootstrap_fixture(Some(RecordType::A), "ipv4_only").await;
+        for _ in 0..2 {
+            assert!(
+                service
+                    .resolve_server_addr(&service.servers["doh"], 0)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "failed lookups must not be cached"
+        );
+        assert!(service.server_addrs.lock().unwrap().is_empty());
+        worker.abort();
+    }
 
     #[tokio::test]
     async fn response_walk_routes_rulesets_and_responds_to_bypass() {
