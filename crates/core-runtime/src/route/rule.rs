@@ -645,6 +645,13 @@ impl Rule {
         }
         match self {
             Rule::Default(rule) if !rule.invert => {
+                for set in &rule.rule_sets {
+                    if set.matches(ctx) {
+                        for tag in set.tags() {
+                            evidence.push(format!("rule_set={tag}"));
+                        }
+                    }
+                }
                 if let Some(host) = domain_host(ctx) {
                     for item in &rule.dest_address {
                         let (kind, values): (&str, Vec<&str>) = match item {
@@ -833,6 +840,14 @@ impl DefaultRule {
         }
         for item in &self.dest_port {
             parts.push(port_description("port", item));
+        }
+        let tags: Vec<String> = self
+            .rule_sets
+            .iter()
+            .flat_map(|set| set.tags().iter().cloned())
+            .collect();
+        if !tags.is_empty() {
+            parts.push(field_list("rule_set", &tags));
         }
         wrap_invert(self.invert, &parts.join(" "))
     }
@@ -1591,6 +1606,36 @@ mod tests {
             assert!(!rule.matches(&ctx));
             assert!(rule.clash_match(&ctx).1.is_empty());
         }
+    }
+
+    #[test]
+    fn connection_monitor_preserves_telegram_rule_set_inside_device_guard() {
+        use super::super::rule_set::{RuleSet, RuleSetRegistry};
+        let mut registry = RuleSetRegistry::new();
+        registry.insert(std::sync::Arc::new(RuleSet::new(
+            vec!["VPN-telegram-community-ruleset".into()],
+            vec![json!({"ip_cidr":"149.154.160.0/20"})],
+        )));
+        let rule = Rule::build_with_rule_sets(
+            &json!({
+                "type":"logical", "mode":"and", "outbound":"VPN-out",
+                "rules":[{"inbound":"in","rule_set":"VPN-telegram-community-ruleset"},
+                         {"source_ip_cidr":"192.168.90.239/32","invert":true}]
+            }),
+            "r",
+            true,
+            &registry,
+        )
+        .unwrap();
+        let mut ctx = ctx_to("unused", 443);
+        ctx.destination = super::super::Target::Ip("149.154.167.50:443".parse().unwrap());
+        assert!(rule.matches(&ctx));
+        let (raw, payload) = rule.clash_match(&ctx);
+        assert!(raw.contains("rule_set=VPN-telegram-community-ruleset"));
+        assert_eq!(payload, "rule_set=VPN-telegram-community-ruleset");
+        ctx.destination = super::super::Target::Ip("203.0.113.5:443".parse().unwrap());
+        assert!(!rule.matches(&ctx));
+        assert!(rule.clash_match(&ctx).1.is_empty());
     }
 
     #[test]
