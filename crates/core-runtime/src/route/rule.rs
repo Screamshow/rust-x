@@ -629,6 +629,97 @@ impl Rule {
         (format!("{payload} => {action}"), String::new())
     }
 
+    /// Capture destination evidence from the rule that actually matched,
+    /// before route actions can change the connection metadata.
+    pub fn clash_match(&self, ctx: &ConnContext) -> (String, String) {
+        let (rule, _) = self.clash_primary();
+        let mut evidence = Vec::new();
+        self.matched_destination(ctx, &mut evidence);
+        evidence.dedup();
+        (rule, evidence.join("; "))
+    }
+
+    fn matched_destination(&self, ctx: &ConnContext, evidence: &mut Vec<String>) {
+        if !self.matches(ctx) {
+            return;
+        }
+        match self {
+            Rule::Default(rule) if !rule.invert => {
+                if let Some(host) = domain_host(ctx) {
+                    for item in &rule.dest_address {
+                        let (kind, values): (&str, Vec<&str>) = match item {
+                            DomainItem::Exact(list) => (
+                                "domain",
+                                list.iter()
+                                    .filter(|value| value.as_str() == host.as_ref())
+                                    .map(String::as_str)
+                                    .collect(),
+                            ),
+                            DomainItem::Suffix(list) => (
+                                "domain_suffix",
+                                list.iter()
+                                    .filter(|value| domain_suffix_match(&host, value))
+                                    .map(String::as_str)
+                                    .collect(),
+                            ),
+                            DomainItem::Keyword(list) => (
+                                "domain_keyword",
+                                list.iter()
+                                    .filter(|value| host.contains(value.as_str()))
+                                    .map(String::as_str)
+                                    .collect(),
+                            ),
+                            DomainItem::Regex(list) => (
+                                "domain_regex",
+                                list.iter()
+                                    .filter(|value| value.is_match(&host))
+                                    .map(Regex::as_str)
+                                    .collect(),
+                            ),
+                        };
+                        evidence.extend(values.into_iter().map(|value| format!("{kind}={value}")));
+                    }
+                }
+                for item in &rule.dest_ip_cidr {
+                    if !item.matches(ctx) {
+                        continue;
+                    }
+                    if item.is_private {
+                        evidence.push("ip_cidr=lan".into());
+                    } else {
+                        for prefix in &item.prefixes {
+                            let matched = match ctx.destination {
+                                super::Target::Ip(addr) => prefix.contains(addr.ip()),
+                                _ => ctx
+                                    .destination_addresses
+                                    .iter()
+                                    .any(|ip| prefix.contains(*ip)),
+                            };
+                            if matched {
+                                evidence.push(format!("ip_cidr={}", prefix.to_cidr()));
+                            }
+                        }
+                    }
+                }
+            }
+            Rule::Logical(rule) if !rule.invert => match rule.mode {
+                LogicalMode::And => {
+                    for child in &rule.rules {
+                        child.matched_destination(ctx, evidence);
+                    }
+                }
+                LogicalMode::Or => {
+                    if let Some(child) = rule.rules.iter().find(|child| child.matches(ctx)) {
+                        child.matched_destination(ctx, evidence);
+                    }
+                }
+            },
+            // Successful negation is evidence of absence, not a positive
+            // domain/subnet match. Keep the full expression as its fallback.
+            _ => {}
+        }
+    }
+
     pub fn matches(&self, ctx: &ConnContext) -> bool {
         match self {
             Rule::Default(r) => r.matches(ctx),
@@ -1477,6 +1568,67 @@ mod tests {
         assert!(reported.contains("example.org"));
         assert!(reported.ends_with("=> route(VPN-out)"));
         assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn connection_monitor_captures_exact_suffix_inside_device_guard() {
+        let rule = Rule::build(&json!({
+            "type":"logical", "mode":"and", "outbound":"VPN-out",
+            "rules":[
+                {"inbound":["in","tproxy6-in"], "domain_suffix":["dell.com","2ip.io","vencord.dev","chatgpt.com"]},
+                {"source_ip_cidr":["192.168.90.239/32"],"invert":true}
+            ]
+        }), "r", true).unwrap();
+        for (host, expected) in [
+            ("ws.chatgpt.com", "chatgpt.com"),
+            ("static.2ip.io", "2ip.io"),
+        ] {
+            let mut ctx = ctx_to(host, 443);
+            let (raw, evidence) = rule.clash_match(&ctx);
+            assert!(raw.starts_with("and("));
+            assert_eq!(evidence, format!("domain_suffix={expected}"));
+            ctx.source.set_ip("192.168.90.239".parse().unwrap());
+            assert!(!rule.matches(&ctx));
+            assert!(rule.clash_match(&ctx).1.is_empty());
+        }
+    }
+
+    #[test]
+    fn connection_monitor_only_explains_the_selected_or_branch() {
+        let rule = Rule::build(&json!({
+            "type":"logical", "mode":"or", "outbound":"o",
+            "rules":[{"domain_suffix":"other.org"},{"domain_suffix":"chatgpt.com"},{"domain_keyword":"chatgpt"}]
+        }), "r", true).unwrap();
+        assert_eq!(
+            rule.clash_match(&ctx_to("ws.chatgpt.com", 443)).1,
+            "domain_suffix=chatgpt.com"
+        );
+        let inverted = Rule::build(
+            &json!({"domain_suffix":"other.org","invert":true,"outbound":"o"}),
+            "r",
+            true,
+        )
+        .unwrap();
+        assert!(
+            inverted
+                .clash_match(&ctx_to("ws.chatgpt.com", 443))
+                .1
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn connection_monitor_captures_resolved_subnet_before_metadata_changes() {
+        let rule = Rule::build(
+            &json!({"ip_cidr":["192.0.2.0/24","203.0.113.0/24"],"outbound":"o"}),
+            "r",
+            true,
+        )
+        .unwrap();
+        let mut ctx = ctx_to("example.org", 443);
+        ctx.destination_addresses
+            .push("203.0.113.5".parse().unwrap());
+        assert_eq!(rule.clash_match(&ctx).1, "ip_cidr=203.0.113.0/24");
     }
 
     #[test]

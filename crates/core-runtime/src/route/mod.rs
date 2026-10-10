@@ -1075,7 +1075,7 @@ impl RouterInner {
                 continue;
             }
             let action = rule.action();
-            ctx.matched_rule = Some(rule.clash_primary());
+            ctx.matched_rule = Some(rule.clash_match(ctx));
             logging::debug(format_args!(
                 "route: match[{i}] {} => {}",
                 ctx.destination,
