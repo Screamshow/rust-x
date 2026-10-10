@@ -12,8 +12,10 @@ baseline while reporting Rust X identity separately. This baseline does not
 claim every Sing-Box feature or protocol. Existing configuration is retained;
 the included procd service is disabled by default on fresh installations.
 
-APK assets are unsigned, intended for explicit local installation with
-`--allow-untrusted`. They are not a signed mirror feed. Existing Forkop
+APK assets are signed with the existing Forkop mirror key. The release includes
+`forkop-apk.pem`; routers must trust this public key in `/etc/apk/keys/`
+(existing mirror installations already use it). Installation does not require
+`--allow-untrusted`. These release assets are not a package feed. Existing Forkop
 defaults, component selectors and mirror update policy are unchanged.
 
 `scripts/package_openwrt.py` validates ELF machine identity and produces
@@ -23,9 +25,18 @@ releases package both formats automatically. The original 0.0.1 core tag
 remains unchanged; `openwrt-packaging-source.tar.gz` supplies the added
 packaging source from main.
 
+Unsigned build outputs are signed on the mirror using `scripts/sign_openwrt.py`
+with the mirror's existing APK tool, private key path and published public key.
+The script checks input hashes, signs APKs individually, verifies signatures,
+and updates manifest hashes, retaining the unsigned hashes for provenance.
+The private key stays on the mirror; it is never bundled or sent to GitHub.
+The packaging workflow refuses to overwrite already signed release packages.
+
 On 2026-10-10, real x86_64 APK/IPK installations on the existing OpenWrt 25/24
 VMs preserved `/etc/config/sing-box`, passed native configuration checks,
 started the normal sing-box service through Forkop and reached watchdog ready.
 The APK installation passed all 42 subscription group-entry HTTPS requests.
 ARM64 package architecture and metadata were checked; ARM64 execution was
 not tested because both available VMs are x86_64.
+Both APK signatures were verified with the public key; the x86_64 signed APK
+was reinstalled on OpenWrt 25 without `--allow-untrusted`.

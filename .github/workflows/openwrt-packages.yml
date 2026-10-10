@@ -19,6 +19,10 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           mkdir binaries
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" -D binaries -p openwrt-manifest.json || true
+          if [ -f binaries/openwrt-manifest.json ]; then
+            python3 -c 'import json; assert not json.load(open("binaries/openwrt-manifest.json"))["apk_signed"], "Signed packages already published; refusing to overwrite them with unsigned packages"'
+          fi
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" -D binaries -p 'rust-x-*.tar.gz' -p SHA256SUMS
           (cd binaries && grep '  rust-x-.*\.tar.gz$' SHA256SUMS | sha256sum -c -)
           for f in binaries/*.tar.gz; do tar -xzf "$f" -C binaries; done
@@ -30,7 +34,7 @@ jobs:
       - name: Package
         run: |
           sudo env SOURCE_DATE_EPOCH=0 python3 scripts/package_openwrt.py --binaries binaries --output dist --apk-tool "$APK_TOOL" --version "$VERSION" --source-commit "$BINARY_COMMIT"
-          tar -czf dist/openwrt-packaging-source.tar.gz scripts/package_openwrt.py scripts/openwrt_apk_tool.sh packaging
+          tar -czf dist/openwrt-packaging-source.tar.gz scripts/package_openwrt.py scripts/sign_openwrt.py scripts/openwrt_apk_tool.sh packaging
           cat binaries/SHA256SUMS dist/OPENWRT-SHA256SUMS | sort -u > dist/SHA256SUMS
           (cd dist && sha256sum openwrt-manifest.json openwrt-packaging-source.tar.gz >> SHA256SUMS)
       - uses: actions/upload-artifact@v4
