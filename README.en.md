@@ -1,3 +1,13 @@
+# Rust X
+
+Rust X is an independent [tachyon-core](https://github.com/Dushnilin/tachyon-core)
+fork for Forkop, not an official Tachyon build or an affiliated project.
+Upstream authorship and the GPL-3.0-only license are preserved.
+
+Rust X version: **0.0.2**, with selected upstream changes and a reduced protocol
+profile documented in [docs/RUST-X.md](docs/RUST-X.md). Unless stated otherwise,
+the inherited documentation below describes upstream capabilities and measurements.
+
 <div align="center">
 
 ![Tachyon Core Banner](assets/readme/hero.svg)

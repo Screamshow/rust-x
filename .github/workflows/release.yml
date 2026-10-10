@@ -69,7 +69,7 @@ jobs:
       - name: Link musl with rust-lld
         if: ${{ matrix.use_musl_lld }}
         run: |
-          flags="-C linker=rust-lld -C link-self-contained=yes -C link-arg=--icf=safe -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
+          flags="-C linker=rust-lld -C target-feature=+crt-static -C link-self-contained=yes -C link-arg=--icf=safe -C link-arg=-z -C link-arg=noseparate-code -C link-arg=-z -C link-arg=norelro"
           echo "RUSTFLAGS=$flags" >> "$GITHUB_ENV"
 
       - name: C compiler for x86_64 musl mimalloc
@@ -171,6 +171,9 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           name: Rust X ${{ steps.notes.outputs.version }}
+          # APKs are signed on the mirror host after the build. Keep artifacts
+          # in a draft until final signatures, hashes and package checks pass.
+          draft: true
           body_path: notes.md
           files: |
             artifacts/*.apk

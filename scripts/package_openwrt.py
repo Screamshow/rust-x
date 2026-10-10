@@ -34,7 +34,7 @@ def main():
     p.add_argument('--binaries', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--apk-tool', required=True)
-    p.add_argument('--version', default='0.0.1')
+    p.add_argument('--version', required=True)
     p.add_argument('--revision', type=int, default=1)
     p.add_argument('--source-commit', required=True)
     a = p.parse_args(); a.output.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,15 @@
 All notable changes to tachyon-core. The version is the workspace version in
 `Cargo.toml`; a tag that disagrees with it is refused by the release workflow.
 
+## 0.0.2
+
+- Ported upstream DNS RCODE names with checked numeric conversion.
+- Fixed connected UDP DNS exchanges and DNS rule-set match fallthrough.
+- Added focused DNS regression tests and independent XHTTP compatibility coverage.
+- Preserved the existing reduced profile, Vision receive fix and TLS fingerprints.
+- Prepared release metadata for Rust X 0.0.2; APK signing and VM validation of
+  the final release packages remain release gates.
+
 ## 0.0.1
 
 First Rust X release for Forkop, based on Tachyon 0.0.1.
