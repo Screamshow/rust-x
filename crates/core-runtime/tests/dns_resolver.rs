@@ -16,6 +16,36 @@ const CERT_PEM: &str = include_str!("../../../tests/golden/certs/localhost.crt")
 const KEY_PEM: &str = include_str!("../../../tests/golden/certs/localhost.key");
 const ROUTER_MAIN: &str = include_str!("../../../tests/golden/live/router-main.json");
 
+#[tokio::test]
+async fn udp_dns_connected_socket_with_and_without_router() {
+    let (addr, hits) = spawn_udp_dns(Ipv4Addr::new(203, 0, 113, 7)).await;
+    let router = core_runtime::route::Router::new(&json!({
+        "outbounds":[{"type":"direct", "tag":"direct"}]
+    }))
+    .unwrap();
+    let server = core_runtime::dns::transport::ServerConfig::build(
+        &json!({
+            "type":"udp", "tag":"test", "server":"127.0.0.1", "server_port":addr.port()
+        }),
+        "dns.servers[0]",
+    )
+    .unwrap();
+    let query =
+        core_runtime::dns::codec::build_query(123, "example.com", hickory_proto::rr::RecordType::A)
+            .unwrap();
+    for router in [None, Some(router)] {
+        let dialer = core_runtime::dns::transport::Dialer { router };
+        let raw = core_runtime::dns::transport::exchange(&server, addr, &query, &dialer)
+            .await
+            .unwrap();
+        assert_eq!(
+            core_runtime::dns::codec::answer_ips(&raw).unwrap(),
+            vec![ip(203, 0, 113, 7)]
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
 type Hits = Arc<AtomicUsize>;
 
 fn ip(a: u8, b: u8, c: u8, d: u8) -> IpAddr {

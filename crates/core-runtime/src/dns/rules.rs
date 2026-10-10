@@ -351,8 +351,8 @@ impl Rule {
                 return false;
             }
         }
-        if !self.rule_sets.is_empty() && self.matches_rule_sets(meta, query) {
-            return true;
+        if !self.rule_sets.is_empty() && !self.matches_rule_sets(meta, query) {
+            return false;
         }
         if !self.domain_suffix.is_empty()
             && !self
@@ -379,17 +379,49 @@ impl Rule {
     }
 }
 
+fn parse_rcode(val: &Value) -> Result<Option<u8>, String> {
+    if let Some(n) = val.as_u64() {
+        return u8::try_from(n)
+            .map(Some)
+            .map_err(|_| "rcode exceeds 255".to_string());
+    }
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(n) = trimmed.parse::<u8>() {
+            return Ok(Some(n));
+        }
+        match trimmed.to_ascii_uppercase().as_str() {
+            "NOERROR" => Ok(Some(0)),
+            "FORMERR" => Ok(Some(1)),
+            "SERVFAIL" => Ok(Some(2)),
+            "NXDOMAIN" => Ok(Some(3)),
+            "NOTIMP" => Ok(Some(4)),
+            "REFUSED" => Ok(Some(5)),
+            "YXDOMAIN" => Ok(Some(6)),
+            "YXRRSET" => Ok(Some(7)),
+            "NXRRSET" => Ok(Some(8)),
+            "NOTAUTH" => Ok(Some(9)),
+            "NOTZONE" => Ok(Some(10)),
+            other => Err(format!("unknown rcode {other:?}")),
+        }
+    } else {
+        Err(format!("invalid rcode format {val:?}"))
+    }
+}
+
 /// `option.DNSRouteActionPredefined`: rcode plus wire-encoded records.
 fn build_predefined(
     map: &serde_json::Map<String, Value>,
     at: &str,
 ) -> anyhow::Result<PredefinedResponse> {
-    let rcode = match map.get("rcode").and_then(Value::as_str) {
-        None | Some("") => None,
-        Some(name) => Some(
-            name.parse::<u8>()
-                .map_err(|_| anyhow::anyhow!("{at}: bad option: unknown rcode {name:?}"))?,
-        ),
+    let rcode = match map.get("rcode") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            parse_rcode(value).map_err(|error| anyhow::anyhow!("{at}: bad option: {error}"))?
+        }
     };
     let records = |key: &str| -> anyhow::Result<Vec<hickory_proto::rr::Record>> {
         let list = match map.get(key) {
@@ -455,6 +487,66 @@ fn string_list(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn predefined_rcode_names_and_bounds() {
+        for (name, code) in [
+            ("NOERROR", 0),
+            ("FORMERR", 1),
+            ("SERVFAIL", 2),
+            ("NXDOMAIN", 3),
+            ("NOTIMP", 4),
+            ("REFUSED", 5),
+            ("YXDOMAIN", 6),
+            ("YXRRSET", 7),
+            ("NXRRSET", 8),
+            ("NOTAUTH", 9),
+            ("NOTZONE", 10),
+        ] {
+            for value in [
+                json!(name),
+                json!(name.to_lowercase()),
+                json!(code),
+                json!(code.to_string()),
+            ] {
+                let rule =
+                    Rule::build(&json!({"action":"predefined", "rcode":value}), "rule").unwrap();
+                let Action::Predefined(response) = rule.action else {
+                    panic!("wrong action")
+                };
+                assert_eq!(response.rcode, Some(code));
+            }
+        }
+        for value in [
+            json!(256),
+            json!("256"),
+            json!(-1),
+            json!(true),
+            json!("unknown"),
+        ] {
+            assert!(Rule::build(&json!({"action":"predefined", "rcode":value}), "rule").is_err());
+        }
+    }
+
+    #[test]
+    fn ruleset_miss_does_not_match_and_hit_keeps_other_conditions() {
+        let mut rule = Rule::build(&json!({"action":"reject"}), "rule").unwrap();
+        rule.rule_sets
+            .push(std::sync::Arc::new(crate::route::rule_set::RuleSet::new(
+                vec!["domains".into()],
+                vec![json!({"domain_suffix":["example.com"]})],
+            )));
+        let meta = QueryMeta::default();
+        assert!(rule.matches(&meta, &info("www.example.com", RecordType::A)));
+        assert!(!rule.matches(&meta, &info("other.test", RecordType::A)));
+        rule.invert = true;
+        assert!(!rule.matches(&meta, &info("www.example.com", RecordType::A)));
+        assert!(rule.matches(&meta, &info("other.test", RecordType::A)));
+        rule.invert = false;
+        rule.domain_keyword.push("allowed".into());
+        assert!(!rule.matches(&meta, &info("www.example.com", RecordType::A)));
+        assert!(rule.matches(&meta, &info("allowed.example.com", RecordType::A)));
+    }
+
     #[test]
     fn logical_rules_combine_sub_rules() {
         let rule = Rule::build(

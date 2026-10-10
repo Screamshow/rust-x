@@ -739,7 +739,9 @@ impl Dialer {
             } else {
                 "[::]:0".parse().unwrap()
             };
-            return UdpSocket::bind(bind).await;
+            let socket = UdpSocket::bind(bind).await?;
+            socket.connect(addr).await?;
+            return Ok(socket);
         };
         let target = crate::inbound::Target::Ip(addr);
         match &cfg.detour {
@@ -807,9 +809,17 @@ async fn exchange_udp(
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
     let socket = dialer.udp(cfg, addr).await?;
-    socket.send_to(query, addr).await?;
+    // Direct and proxied DNS sockets are connected to their actual peer (which
+    // may be a local relay rather than addr). Preserve that peer on send.
+    match socket.send(query).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => {
+            socket.send_to(query, addr).await?;
+        }
+        Err(error) => return Err(error),
+    }
     let mut buf = vec![0u8; 65535];
-    let (n, _from) = socket.recv_from(&mut buf).await?;
+    let n = socket.recv(&mut buf).await?;
     buf.truncate(n);
     Ok(buf)
 }
