@@ -57,7 +57,7 @@ def main():
     if not re.fullmatch(r'rust-x-v\d+\.\d+\.\d+', args.tag):
         raise ValueError('Invalid release tag')
     version = args.tag.removeprefix('rust-x-v')
-    release = json.loads(run('gh', 'release', 'view', args.tag, '--repo', REPO, '--json', 'isDraft', capture=True))
+    release = json.loads(run('gh', 'release', 'view', args.tag, '--repo', REPO, '--json', 'isDraft,databaseId', capture=True))
     if not release['isDraft']:
         raise ValueError('Refusing to replace an already public release')
     args.output.mkdir(parents=True, exist_ok=True)
@@ -94,7 +94,8 @@ def main():
         checksum.write_text(''.join(f'{a["sha256"]}  {a["file"]}\n' for a in final['assets']))
         run('gh', 'release', 'upload', args.tag, '--repo', REPO, '--clobber',
             *[str(args.output / n) for n in names if n != 'OPENWRT-SHA256SUMS'], str(checksum))
-        published_assets = json.loads(run('gh', 'api', f'repos/{REPO}/releases/tags/{args.tag}', capture=True))['assets']
+        # The tag endpoint excludes drafts; address the authenticated draft by ID.
+        published_assets = json.loads(run('gh', 'api', f'repos/{REPO}/releases/{release["databaseId"]}', capture=True))['assets']
         uploaded = {asset['name']: asset for asset in published_assets}
         for name in [n for n in names if n != 'OPENWRT-SHA256SUMS'] + ['SHA256SUMS']:
             local = args.output / name
