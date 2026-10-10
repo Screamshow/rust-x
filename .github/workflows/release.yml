@@ -132,6 +132,15 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Install OpenWrt APK host tool
+        run: bash scripts/openwrt_apk_tool.sh
+      - name: OpenWrt APK/IPK packages
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          for archive in artifacts/*.tar.gz; do tar -xzf "$archive" -C artifacts; done
+          sudo python3 scripts/package_openwrt.py --binaries artifacts --output artifacts --apk-tool "$APK_TOOL" --version "${tag#rust-x-v}" --source-commit "$(git rev-parse HEAD)"
+          cat artifacts/OPENWRT-SHA256SUMS > artifacts/openwrt.sha256
+          rm artifacts/OPENWRT-SHA256SUMS
       - name: One checksum file for everything
         run: |
           cd artifacts
@@ -161,5 +170,8 @@ jobs:
           body_path: notes.md
           files: |
             artifacts/*.tar.gz
+            artifacts/*.apk
+            artifacts/*.ipk
+            artifacts/openwrt-manifest.json
             artifacts/SHA256SUMS
           fail_on_unmatched_files: false

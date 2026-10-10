@@ -1,0 +1,44 @@
+name: OpenWrt packages
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Rust X binary release tag
+        required: true
+        default: rust-x-v0.0.1
+permissions:
+  contents: write
+jobs:
+  packages:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get verified released binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          mkdir binaries
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" -D binaries -p 'rust-x-*.tar.gz' -p SHA256SUMS
+          (cd binaries && grep '  rust-x-.*\.tar.gz$' SHA256SUMS | sha256sum -c -)
+          for f in binaries/*.tar.gz; do tar -xzf "$f" -C binaries; done
+          git fetch origin tag "$RELEASE_TAG"
+          echo "BINARY_COMMIT=$(git rev-parse "$RELEASE_TAG^{commit}")" >> "$GITHUB_ENV"
+          echo "VERSION=${RELEASE_TAG#rust-x-v}" >> "$GITHUB_ENV"
+      - name: Install OpenWrt APK host tool
+        run: bash scripts/openwrt_apk_tool.sh
+      - name: Package
+        run: |
+          sudo env SOURCE_DATE_EPOCH=0 python3 scripts/package_openwrt.py --binaries binaries --output dist --apk-tool "$APK_TOOL" --version "$VERSION" --source-commit "$BINARY_COMMIT"
+          tar -czf dist/openwrt-packaging-source.tar.gz scripts/package_openwrt.py scripts/openwrt_apk_tool.sh packaging
+          cat binaries/SHA256SUMS dist/OPENWRT-SHA256SUMS | sort -u > dist/SHA256SUMS
+          (cd dist && sha256sum openwrt-manifest.json openwrt-packaging-source.tar.gz >> SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-x-openwrt
+          path: dist/*
+      - name: Attach packages to the existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

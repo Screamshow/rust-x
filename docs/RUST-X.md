@@ -20,7 +20,8 @@ tests require it; profile tests use `cargo test -p core-config --test rust_x_pro
 Shared helpers under VMess/Shadowsocks/FPTN remain in the source because
 retained protocols use them. Release LTO removes unreachable implementations;
 independent removed modules and OpenVPN/Snell-only dependencies are feature-gated.
-This is a local experimental profile, not an OpenWrt package release.
+OpenWrt APK/IPK packaging and installation checks are described in
+[OpenWrt packages](OPENWRT-PACKAGES.md).
 
 Forkop subscription testing and the native TLS read-side Vision Direct fix are
 documented in [FORKOP-VM25-2026-10-10.md](FORKOP-VM25-2026-10-10.md).

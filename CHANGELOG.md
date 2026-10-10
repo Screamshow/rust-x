@@ -18,8 +18,11 @@ The primary OpenWrt 25 VM passed all 42 subscription group-entry HTTPS checks;
 Firefox/Safari TCP/REALITY and gRPC, and Chrome on both XHTTP nodes were tested.
 See docs/RUST-X.md and docs/RUST-X-UTLS-2026-10-10.md for scope and limitations.
 
-Assets are Linux musl standalone binaries for ARM64 and x86_64, not OpenWrt APK/IPK packages. SHA256SUMS covers
-release archives. Upstream licenses and source history are retained.
+Assets include Linux musl standalone binaries and OpenWrt APK/IPK packages
+for ARM64 and x86_64. Packages are named rust-x; APKs are unsigned for explicit
+local installation. SHA256SUMS covers release downloads. Upstream licenses
+and source history are retained. See docs/OPENWRT-PACKAGES.md for installation
+checks and packaging source provenance.
 ## Upstream Tachyon 0.0.1
 
 The first tagged build. A routing core for OpenWrt: the client stack end to
