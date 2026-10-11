@@ -72,7 +72,7 @@ pub(crate) fn spawn_bridge(stream: AnyStream, peer: UdpSocket) {
     // buffer would mean a lock on the data path. That is 128 KiB per relay, which
     // is what it costs to never truncate a datagram -- ponytail: fine while the
     // number of concurrent UDP relays is small, pool the buffers if it is not.
-    tokio::spawn(async move {
+    let downstream = async move {
         let mut buf = vec![0u8; DATAGRAM_BUF];
         loop {
             match reader.read(&mut buf).await {
@@ -85,20 +85,48 @@ pub(crate) fn spawn_bridge(stream: AnyStream, peer: UdpSocket) {
                 Err(_) => break,
             }
         }
-    });
-    tokio::spawn(async move {
+    };
+    let upstream = async move {
         let mut buf = vec![0u8; DATAGRAM_BUF];
         while let Ok(n) = peer_recv.recv(&mut buf).await {
             if writer.write_all(&buf[..n]).await.is_err() {
                 break;
             }
         }
+    };
+    tokio::spawn(async move {
+        tokio::select! { _ = downstream => {}, _ = upstream => {} }
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bridge_releases_udp_socket_after_remote_eof() {
+        for _ in 0..32 {
+            let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
+            let address = peer.local_addr().unwrap();
+            let (stream, remote) = tokio::io::duplex(1024);
+            spawn_bridge(Box::new(stream), peer);
+            drop(remote);
+            drop(client);
+            let released = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if UdpSocket::bind(address).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                released.is_ok(),
+                "bridge retained UDP socket after remote EOF"
+            );
+        }
+    }
 
     #[test]
     fn request_headers_match_the_reference() {

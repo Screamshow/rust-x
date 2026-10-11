@@ -282,7 +282,7 @@ pub(crate) fn spawn_packet_bridge(
     let out_socket = Arc::new(peer);
     let in_socket = Arc::clone(&out_socket);
     let mut out = PacketWriter::new(mode);
-    tokio::spawn(async move {
+    let upstream = async move {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             let Ok(n) = in_socket.recv(&mut buf).await else {
@@ -295,9 +295,9 @@ pub(crate) fn spawn_packet_bridge(
                 break;
             }
         }
-    });
+    };
     let mut input = PacketReader::new(mode);
-    tokio::spawn(async move {
+    let downstream = async move {
         loop {
             let Ok(packet) = input.read(&mut reader).await else {
                 break;
@@ -306,12 +306,47 @@ pub(crate) fn spawn_packet_bridge(
                 break;
             }
         }
+    };
+    tokio::spawn(async move {
+        tokio::select! { _ = downstream => {}, _ = upstream => {} }
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn packet_bridge_releases_udp_socket_after_remote_eof() {
+        for mode in [PacketEncoding::LengthPrefixed, PacketEncoding::Xudp] {
+            for _ in 0..32 {
+                let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
+                let address = peer.local_addr().unwrap();
+                let (stream, remote) = tokio::io::duplex(1024);
+                spawn_packet_bridge(
+                    Box::new(stream),
+                    peer,
+                    mode,
+                    Target::Ip("127.0.0.1:53".parse().unwrap()),
+                );
+                drop(remote);
+                drop(client);
+                let released = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        if UdpSocket::bind(address).await.is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                assert!(
+                    released.is_ok(),
+                    "packet bridge retained UDP socket after remote EOF"
+                );
+            }
+        }
+    }
 
     async fn feed(framed: Vec<u8>, mode: PacketEncoding) -> Vec<Vec<u8>> {
         let (client, server) = tokio::io::duplex(8192);
