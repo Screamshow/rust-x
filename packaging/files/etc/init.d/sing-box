@@ -22,6 +22,7 @@ start_service() {
     [ -z "$ifaces" ] || procd_set_param netdev $ifaces
     procd_set_param stdout 1
     procd_set_param stderr 1
+    procd_set_param limits nofile="65535 65535"
     procd_set_param respawn
     procd_close_instance
 }

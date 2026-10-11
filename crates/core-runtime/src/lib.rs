@@ -161,6 +161,7 @@ impl BoxInstance {
 
         // 5. Connect DNS service to the shared router and publish globally
         if let Some(service) = &new_dns {
+            service.attach_cache(self.cache_file.clone());
             service.set_router(Arc::clone(&self.router));
         }
         dns::set_service(new_dns.clone());
@@ -186,6 +187,7 @@ impl BoxInstance {
         for task in self.tasks.into_iter().chain(self.router.take_probe_tasks()) {
             task.abort();
         }
+        flush_cache(&self.cache_file);
     }
 
     /// Wait until aborted listener tasks have released their sockets.
@@ -193,6 +195,15 @@ impl BoxInstance {
         let mut tasks = self.tasks;
         tasks.extend(self.router.take_probe_tasks());
         stop_tasks(tasks).await;
+        flush_cache(&self.cache_file);
+    }
+}
+
+fn flush_cache(cache: &Option<cache_file::SharedCacheFile>) {
+    if let Some(cache) = cache
+        && let Err(error) = cache.lock().expect("cache").flush()
+    {
+        logging::warn(format_args!("cache file: shutdown flush failed ({error})"));
     }
 }
 
@@ -267,6 +278,7 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
     let dns_service = dns::DnsService::build_with_rule_sets(root, Some(&router.rule_sets()))
         .context("dns section")?;
     if let Some(service) = &dns_service {
+        service.attach_cache(cache_file.clone());
         // `dns.server.detour` dials through the outbounds
         service.set_router(Arc::clone(&router));
     }
@@ -440,6 +452,16 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
         }
     }
 
+    if let Some(cache) = &cache_file {
+        let cache = Arc::clone(cache);
+        tasks.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                cache.lock().expect("cache").flush_if_due();
+            }
+        }));
+    }
     Ok(BoxInstance {
         router,
         tasks: std::mem::take(tasks),
