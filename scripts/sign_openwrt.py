@@ -25,7 +25,10 @@ with tempfile.TemporaryDirectory(prefix='rust-x-trusted-keys-') as temp:
             raise ValueError(f'Input digest mismatch: {package.name}')
         if asset['format'] != 'apk':
             continue
-        subprocess.run([a.apk_tool, 'adbsign', '--allow-untrusted', '--sign-key', a.sign_key, str(package.resolve())], check=True)
+        verified = subprocess.run([a.apk_tool, '--keys-dir', temp, 'verify', str(package.resolve())],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if verified.returncode:
+            subprocess.run([a.apk_tool, 'adbsign', '--allow-untrusted', '--sign-key', a.sign_key, str(package.resolve())], check=True)
         subprocess.run([a.apk_tool, '--keys-dir', temp, 'verify', str(package.resolve())], check=True)
         asset.setdefault('unsigned_sha256', original)
         asset['sha256'] = hashlib.sha256(package.read_bytes()).hexdigest()
