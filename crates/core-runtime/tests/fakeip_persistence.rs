@@ -204,3 +204,22 @@ fn go_metadata_cursor_and_wrap_preserve_paired_records() {
     assert_eq!(reopened.lookup_address("old.example", false), None);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn lru_eviction_removes_both_reverse_maps_without_persistent_cache() {
+    let store = pool();
+    let first4 = store.create("first.example", false).unwrap();
+    let first6 = store.create("first.example", true).unwrap();
+    for index in 0..16384 {
+        let domain = format!("eviction-{index}.example");
+        store.create(&domain, false).unwrap();
+        store.create(&domain, true).unwrap();
+    }
+    assert_eq!(store.lookup_address("first.example", false), None);
+    assert_eq!(store.lookup_address("first.example", true), None);
+    assert_eq!(store.lookup_domain(first4), None);
+    assert_eq!(store.lookup_domain(first6), None);
+    let last = "eviction-16383.example";
+    let address = store.lookup_address(last, false).unwrap();
+    assert_eq!(store.lookup_domain(address).as_deref(), Some(last));
+}
