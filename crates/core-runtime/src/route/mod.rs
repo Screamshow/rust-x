@@ -743,6 +743,7 @@ fn detect_default_interface() -> Option<String> {
 }
 
 pub struct RouterInner {
+    pub(crate) probe_tls: tokio_rustls::TlsConnector,
     pub(crate) outbounds: Vec<Outbound>,
     pub(crate) tags: HashMap<String, usize>,
     pub(crate) default: usize,
@@ -989,6 +990,7 @@ impl RouterInner {
             .map(|_| std::sync::Mutex::new(None))
             .collect();
         Ok(RouterInner {
+            probe_tls: crate::tls_client::probe_connector(&root)?,
             outbounds,
             tags,
             default,

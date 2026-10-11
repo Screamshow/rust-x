@@ -1356,7 +1356,7 @@ async fn delay_test(
         };
         let dial_ms = start.elapsed();
         let mut stream: crate::inbound::AnyStream = if tls {
-            match tls_client::wrap_probe(conn, &host).await {
+            match tls_client::wrap_probe(conn, &host, &router.inner().probe_tls).await {
                 Ok(s) => s,
                 Err(e) => {
                     crate::logging::debug(format_args!("delay[{index}]: tls {host}: {e}"));
