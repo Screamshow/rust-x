@@ -35,6 +35,7 @@ jobs:
       # covers what the unprivileged `cargo test` above can only skip.
       - name: Exit gate (privileged)
         run: |
+          sudo -E env "PATH=$PATH" TACHYON_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --features legacy-protocols --lib outbound::dial::tests::the_options_reach_the_socket -- --exact
           sudo -E env "PATH=$PATH" cargo test -p core-runtime --features legacy-protocols --test exit_gate -- --nocapture
           sudo -E env "PATH=$PATH" cargo test -p core-runtime --features legacy-protocols --test inbounds -- --nocapture
 

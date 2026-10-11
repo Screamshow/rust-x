@@ -1362,8 +1362,28 @@ mod tests {
         // Options are applied without connecting; loopback intentionally skips SO_MARK.
         let addr: SocketAddr = "192.0.2.1:9".parse().unwrap();
         let fd = new_socket(&addr, false).expect("socket");
-        options.apply(fd, &addr, false).expect("apply");
-        assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_MARK), 0x1234);
+        let mark_applied = match options.apply(fd, &addr, false) {
+            Ok(()) => true,
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && std::env::var("TACHYON_TEST_REQUIRE_SO_MARK").as_deref() != Ok("1") =>
+            {
+                // Unprivileged CI still checks the other options; a separate
+                // mandatory privileged pass verifies SO_MARK itself.
+                let unmarked = DialOptions {
+                    routing_mark: None,
+                    ..options.clone()
+                };
+                unmarked
+                    .apply(fd, &addr, false)
+                    .expect("unprivileged options");
+                false
+            }
+            Err(error) => panic!("apply: {error}"),
+        };
+        if mark_applied {
+            assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_MARK), 0x1234);
+        }
         assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR), 1);
         assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
         assert_eq!(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 42);
