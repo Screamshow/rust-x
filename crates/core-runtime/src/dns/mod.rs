@@ -976,6 +976,19 @@ impl DnsService {
         host: &str,
         depth: u8,
     ) -> std::io::Result<Vec<IpAddr>> {
+        if resolver.kind == Kind::Hosts {
+            return Ok(resolver
+                .hosts
+                .as_ref()
+                .map(|sources| sources.lookup(host))
+                .unwrap_or_default());
+        }
+        if matches!(resolver.kind, Kind::Local | Kind::Dhcp | Kind::Resolved) {
+            return Ok(match self.neighbor_lookup(resolver, host) {
+                Some(addresses) => addresses,
+                None => system_lookup(host).await,
+            });
+        }
         let mut out = Vec::new();
         let mut last_error = None;
         for qtype in self.strategy.query_types() {

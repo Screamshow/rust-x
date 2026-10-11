@@ -95,6 +95,7 @@ pub struct ConnContext {
     pub sniff_prefix: Vec<u8>,
     pub sniff_error: Option<SniffError>,
     pub sniffer_names: Vec<String>,
+    pub sniff_timeout: Option<Duration>,
     pub ip_version: Option<u8>,
     pub route_original_destination: Option<Target>,
     /// Clash connection view: the rule that produced the decision.
@@ -134,6 +135,7 @@ impl Default for ConnContext {
             sniff_prefix: Vec::new(),
             sniff_error: None,
             sniffer_names: Vec::new(),
+            sniff_timeout: None,
             ip_version: None,
             route_original_destination: None,
             matched_rule: None,
@@ -1077,7 +1079,7 @@ impl RouterInner {
         &self,
         mut client: Option<&mut S>,
         ctx: &mut ConnContext,
-        packet: Option<&[u8]>,
+        packet: Option<&[&[u8]]>,
     ) -> io::Result<Decision>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -1104,11 +1106,16 @@ impl RouterInner {
                     if let Some(c) = client.as_deref_mut() {
                         sniff::action_sniff(c, ctx, sniffer, *timeout).await;
                     } else if let Some(packet) = packet {
-                        sniff::action_sniff_packet(packet, ctx, sniffer);
+                        sniff::action_sniff_packet(packet, ctx, sniffer, *timeout);
                     }
                 }
                 Action::Resolve(res) => {
-                    action_resolve(ctx, res).await?;
+                    if let Err(err) = action_resolve(ctx, res).await {
+                        logging::debug(format_args!(
+                            "route: resolve failed for {}: {err}",
+                            ctx.destination
+                        ));
+                    }
                 }
                 _ => {}
             }
@@ -1275,6 +1282,14 @@ impl Router {
 
     /// Route a datagram without consuming or modifying its payload.
     pub async fn route_packet(&self, ctx: &mut ConnContext, packet: &[u8]) -> io::Result<Decision> {
+        self.route_datagrams(ctx, &[packet]).await
+    }
+
+    pub async fn route_datagrams(
+        &self,
+        ctx: &mut ConnContext,
+        packet: &[&[u8]],
+    ) -> io::Result<Decision> {
         self.inner()
             .route_walk_packet::<tokio::net::TcpStream>(None, ctx, Some(packet))
             .await
@@ -1466,6 +1481,15 @@ async fn action_resolve(ctx: &mut ConnContext, action: &ResolveAction) -> io::Re
     ));
     if ctx.ip_version.is_none() && !addrs.is_empty() {
         ctx.ip_version = Some(if addrs[0].is_ipv6() { 6 } else { 4 });
+    }
+    if let Some(&ip) = addrs.first() {
+        if ctx.domain.is_none()
+            && let Target::Domain(ref h, _) = ctx.destination
+        {
+            ctx.domain = Some(h.clone());
+        }
+        let port = ctx.destination.port();
+        ctx.destination = Target::Ip(SocketAddr::new(ip, port));
     }
     ctx.destination_addresses = addrs;
     Ok(())
@@ -1797,5 +1821,117 @@ mod tests {
         let e = reject_error(RejectMethod::Drop, false, &flood);
         assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
         assert!(!flood.trigger(), "drop method must not touch the counter");
+    }
+
+    #[tokio::test]
+    async fn action_resolve_failure_is_non_fatal_and_continues_routing() {
+        let config = json!({
+            "outbounds": [
+                {"type": "direct", "tag": "direct"},
+                {"type": "direct", "tag": "fallback"}
+            ],
+            "route": {
+                "rules": [
+                    {
+                        "domain_suffix": ["youtube.com"],
+                        "action": "resolve",
+                        "server": "non-existent-dns-server"
+                    },
+                    {
+                        "domain_suffix": ["youtube.com"],
+                        "action": "route",
+                        "outbound": "fallback"
+                    }
+                ],
+                "final": "direct"
+            }
+        });
+        let router = Router::new(&config).unwrap();
+        let mut ctx = ConnContext::new(
+            "tun",
+            "192.168.1.100:12345".parse().unwrap(),
+            Target::Domain("www.youtube.com".into(), 443),
+            "tcp",
+        );
+        let decision = router
+            .route_raw(&mut ctx)
+            .await
+            .expect("route should succeed despite resolve failure");
+        let Decision::Outbound(idx) = decision else {
+            panic!("expected outbound decision");
+        };
+        assert_eq!(idx, router.index_of("fallback").unwrap());
+    }
+
+    async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    #[tokio::test]
+    async fn action_resolve_rewrites_destination_to_ip_and_preserves_domain() {
+        let _g = test_guard().await;
+        let dns_config = json!({
+            "dns": {
+                "servers": [
+                    {
+                        "type": "hosts",
+                        "tag": "local-dns",
+                        "predefined": {
+                            "www.youtube.com": "142.250.186.206"
+                        }
+                    }
+                ],
+                "final": "local-dns"
+            }
+        });
+        let dns = crate::dns::DnsService::build(&dns_config).unwrap().unwrap();
+        crate::dns::set_service(Some(dns));
+
+        let config = json!({
+            "outbounds": [
+                {"type": "direct", "tag": "direct"},
+                {"type": "direct", "tag": "yt-out"}
+            ],
+            "route": {
+                "rules": [
+                    {
+                        "domain_suffix": ["youtube.com"],
+                        "action": "resolve",
+                        "server": "local-dns"
+                    },
+                    {
+                        "domain_suffix": ["youtube.com"],
+                        "action": "route",
+                        "outbound": "yt-out"
+                    }
+                ],
+                "final": "direct"
+            }
+        });
+        let router = Router::new(&config).unwrap();
+        let mut ctx = ConnContext::new(
+            "tun",
+            "192.168.1.100:12345".parse().unwrap(),
+            Target::Domain("www.youtube.com".into(), 443),
+            "tcp",
+        );
+        let decision = router
+            .route_raw(&mut ctx)
+            .await
+            .expect("route should succeed");
+        let Decision::Outbound(idx) = decision else {
+            panic!("expected outbound decision");
+        };
+        assert_eq!(idx, router.index_of("yt-out").unwrap());
+        // Verify ctx.domain is preserved for subsequent rules
+        assert_eq!(ctx.domain.as_deref(), Some("www.youtube.com"));
+        // Verify ctx.destination is rewritten to resolved IP:
+        assert_eq!(
+            ctx.destination,
+            Target::Ip("142.250.186.206:443".parse().unwrap())
+        );
+
+        crate::dns::set_service(None);
     }
 }
