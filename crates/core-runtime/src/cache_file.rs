@@ -115,13 +115,16 @@ impl CacheFileOptions {
 /// The process-wide handle: the store is shared by the rule-set registry and
 /// the dns service, both of which outlive any single borrow.
 pub type SharedCacheFile = std::sync::Arc<std::sync::Mutex<CacheFile>>;
+type BucketValues = BTreeMap<Vec<u8>, Vec<u8>>;
+type CacheBuckets = BTreeMap<String, BucketValues>;
+type CacheChange<'a> = (&'a str, Vec<u8>, Option<Vec<u8>>);
 
 /// The in-memory mirror of the file, flushed on demand.
 #[derive(Debug)]
 pub struct CacheFile {
     options: CacheFileOptions,
     path: PathBuf,
-    buckets: BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>>,
+    buckets: CacheBuckets,
     dirty: bool,
     /// Bytes written since the last flush, the measure `buffer_size` bounds.
     pending: usize,
@@ -212,7 +215,7 @@ impl CacheFile {
     }
 
     /// Update paired records before a due flush can expose half an update.
-    pub(crate) fn apply_changes(&mut self, changes: Vec<(&str, Vec<u8>, Option<Vec<u8>>)>) {
+    pub(crate) fn apply_changes(&mut self, changes: Vec<CacheChange<'_>>) {
         for (bucket, key, value) in changes {
             let entries = self.buckets.entry(bucket.to_string()).or_default();
             self.pending += key.len() + value.as_ref().map_or(0, Vec::len);
@@ -370,7 +373,7 @@ pub mod saved_binary {
     }
 }
 
-fn read_all(db: &Db) -> BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>> {
+fn read_all(db: &Db) -> CacheBuckets {
     let mut buckets = BTreeMap::new();
     let mut load = |name: &str| {
         if !db.has_bucket(&[name]).unwrap_or(false) {
@@ -423,7 +426,7 @@ fn extra_buckets(db: &Db) -> Vec<String> {
 }
 
 /// Walk every key of a bucket through the page tree.
-fn collect(db: &Db, path: &[&str], out: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
+fn collect(db: &Db, path: &[&str], out: &mut BucketValues) {
     let Ok(Some(page)) = db.bucket_page_raw(path) else {
         return;
     };
@@ -435,7 +438,7 @@ fn collect(db: &Db, path: &[&str], out: &mut BTreeMap<Vec<u8>, Vec<u8>>) {
     }
 }
 
-fn build_tree(buckets: &BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>>) -> NodeSpec {
+fn build_tree(buckets: &CacheBuckets) -> NodeSpec {
     let mut entries = Vec::with_capacity(buckets.len());
     for (name, kv) in buckets {
         let node = NodeSpec {

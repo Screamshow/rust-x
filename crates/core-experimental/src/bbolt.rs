@@ -147,6 +147,7 @@ fn branch_elems(page: &[u8]) -> io::Result<Vec<Elem>> {
 
 /// A bucket's key/value pairs, in key order.
 pub type BucketEntries = Vec<(String, Vec<u8>)>;
+pub type RawBucketEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub struct Db {
     data: Vec<u8>,
@@ -244,7 +245,7 @@ impl Db {
     }
 
     /// Preserve binary keys such as sing-box's packed FakeIP addresses.
-    pub fn bucket_page_raw(&self, path: &[&str]) -> io::Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
+    pub fn bucket_page_raw(&self, path: &[&str]) -> io::Result<Option<RawBucketEntries>> {
         let mut page = self.load_page(self.meta.root)?;
         for segment in path {
             let entry = self
@@ -267,7 +268,7 @@ impl Db {
         Ok(())
     }
 
-    fn collect_pairs(&self, page: &[u8], out: &mut Vec<(Vec<u8>, Vec<u8>)>) -> io::Result<()> {
+    fn collect_pairs(&self, page: &[u8], out: &mut RawBucketEntries) -> io::Result<()> {
         for elem in self.all_elems(page)? {
             if elem.flags & BUCKET_LEAF_FLAG != 0 {
                 continue;
