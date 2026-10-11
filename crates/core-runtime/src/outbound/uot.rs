@@ -65,6 +65,12 @@ pub(crate) fn magic_authority(version: u8) -> String {
 /// Bidirectional datagram bridge between a loopback socket pair and the
 /// tunnel stream, so `connect_udp` can hand out a plain `UdpSocket`.
 pub(crate) fn spawn_bridge(stream: AnyStream, peer: UdpSocket) {
+    spawn_bridge_with_timeout(stream, peer, crate::outbound::packet::udp_bridge_timeout());
+}
+
+fn spawn_bridge_with_timeout(stream: AnyStream, peer: UdpSocket, timeout: std::time::Duration) {
+    let (activity, idle) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let sent = activity.clone();
     let (mut reader, mut writer) = tokio::io::split(stream);
     let peer_send = Arc::new(peer);
     let peer_recv = Arc::clone(&peer_send);
@@ -78,6 +84,7 @@ pub(crate) fn spawn_bridge(stream: AnyStream, peer: UdpSocket) {
             match reader.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    activity.send_replace(tokio::time::Instant::now());
                     if peer_send.send(&buf[..n]).await.is_err() {
                         break;
                     }
@@ -89,19 +96,76 @@ pub(crate) fn spawn_bridge(stream: AnyStream, peer: UdpSocket) {
     let upstream = async move {
         let mut buf = vec![0u8; DATAGRAM_BUF];
         while let Ok(n) = peer_recv.recv(&mut buf).await {
+            sent.send_replace(tokio::time::Instant::now());
             if writer.write_all(&buf[..n]).await.is_err() {
                 break;
             }
         }
     };
     tokio::spawn(async move {
-        tokio::select! { _ = downstream => {}, _ = upstream => {} }
+        tokio::select! { _ = downstream => {}, _ = upstream => {}, _ = crate::outbound::packet::wait_bridge_idle(idle, timeout) => {} }
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bridge_uses_scoped_route_idle_timeout() {
+        let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
+        let address = peer.local_addr().unwrap();
+        let (stream, _remote) = tokio::io::duplex(1024);
+        crate::outbound::packet::UDP_BRIDGE_TIMEOUT
+            .scope(std::time::Duration::from_millis(50), async {
+                spawn_bridge(Box::new(stream), peer);
+            })
+            .await;
+        drop(client);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            UdpSocket::bind(address).await.is_ok(),
+            "route timeout ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_releases_abandoned_udp_socket_with_open_tunnel() {
+        for _ in 0..16 {
+            let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
+            let address = peer.local_addr().unwrap();
+            let (stream, _remote) = tokio::io::duplex(1024);
+            spawn_bridge_with_timeout(Box::new(stream), peer, std::time::Duration::from_millis(50));
+            drop(client);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(
+                UdpSocket::bind(address).await.is_ok(),
+                "idle UOT socket retained"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_only_bridge_survives_multiple_idle_windows() {
+        let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
+        let (stream, mut remote) = tokio::io::duplex(1024);
+        spawn_bridge_with_timeout(
+            Box::new(stream),
+            peer,
+            std::time::Duration::from_millis(150),
+        );
+        let mut buf = [0u8; 1];
+        for _ in 0..12 {
+            remote.write_all(b"x").await.unwrap();
+            let n =
+                tokio::time::timeout(std::time::Duration::from_millis(100), client.recv(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&buf[..n], b"x");
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+    }
 
     #[tokio::test]
     async fn bridge_releases_udp_socket_after_remote_eof() {
