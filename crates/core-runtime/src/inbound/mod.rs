@@ -1152,7 +1152,11 @@ pub(crate) async fn drive_framed(
             let dest = ctx.destination.clone();
             let conn = router.connect_index(idx, &dest).await?;
             logging::info(format_args!("inbound {tag} {peer} CONNECT {dest}"));
-            let tracker = clash_state::ConnHandle::open_with_context(clash_meta(&ctx, router, idx), &ctx, router);
+            let tracker = clash_state::ConnHandle::open_with_context(
+                clash_meta(&ctx, router, idx),
+                &ctx,
+                router,
+            );
             pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
         }
     }

@@ -230,7 +230,11 @@ async fn socks4(
                 Ok(conn) => {
                     client.write_all(&granted).await?;
                     logging::info(format_args!("socks[{tag}] {peer} CONNECT {dest}"));
-                    let tracker = clash_state::ConnHandle::open_with_context(clash_meta(&ctx, router, idx), &ctx, router);
+                    let tracker = clash_state::ConnHandle::open_with_context(
+                        clash_meta(&ctx, router, idx),
+                        &ctx,
+                        router,
+                    );
                     pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
                 }
                 Err(err) => {
@@ -405,7 +409,11 @@ async fn socks5(
                     // a reply that only its own first packet can trigger.
                     client.established().await?;
                     logging::info(format_args!("mixed[{tag}] {peer} CONNECT {dest}"));
-                    let tracker = clash_state::ConnHandle::open_with_context(clash_meta(&ctx, router, idx), &ctx, router);
+                    let tracker = clash_state::ConnHandle::open_with_context(
+                        clash_meta(&ctx, router, idx),
+                        &ctx,
+                        router,
+                    );
                     pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
                 }
                 Err(err) => {
@@ -652,7 +660,11 @@ async fn http_connect(
             let dest = ctx.destination.clone();
             let conn = router.connect_index(idx, &dest).await?;
             logging::info(format_args!("mixed[{tag}] {peer} CONNECT {dest}"));
-            let tracker = clash_state::ConnHandle::open_with_context(clash_meta(&ctx, router, idx), &ctx, router);
+            let tracker = clash_state::ConnHandle::open_with_context(
+                clash_meta(&ctx, router, idx),
+                &ctx,
+                router,
+            );
             pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
         }
     }
