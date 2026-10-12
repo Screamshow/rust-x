@@ -760,6 +760,7 @@ pub struct RouterInner {
 }
 
 pub struct Router {
+    connection_scope: Arc<()>,
     inner: std::sync::RwLock<Arc<RouterInner>>,
     applied_config: std::sync::Mutex<Value>,
 }
@@ -1154,6 +1155,7 @@ impl Router {
     pub(crate) fn prepare(root: &Value) -> anyhow::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             inner: std::sync::RwLock::new(Arc::new(RouterInner::build(root)?)),
+            connection_scope: Arc::new(()),
             applied_config: std::sync::Mutex::new(serde_json::json!({"generation": 0})),
         }))
     }
@@ -1162,6 +1164,7 @@ impl Router {
         let inner = RouterInner::build(root)?;
         let router = Arc::new(Router {
             inner: std::sync::RwLock::new(Arc::new(inner)),
+            connection_scope: Arc::new(()),
             applied_config: std::sync::Mutex::new(serde_json::json!({"generation": 0})),
         });
         let inner_ref = router.inner();
@@ -1195,6 +1198,10 @@ impl Router {
         self.applied_config.lock().expect("applied config").clone()
     }
 
+    pub(crate) fn connection_scope(&self) -> Arc<()> {
+        Arc::clone(&self.connection_scope)
+    }
+
     pub(crate) fn record_applied_config(&self, root: &Value) {
         let hash = crate::configuration_fingerprint(root);
         let mut state = self.applied_config.lock().expect("applied config");
@@ -1202,7 +1209,7 @@ impl Router {
         *state = serde_json::json!({
             "pid": std::process::id(), "generation": generation,
             "config_sha256": hash, "ready": true,
-            "hot_reload": true, "schema": 1
+            "hot_reload": true, "connection_revalidation": true, "schema": 1
         });
     }
 

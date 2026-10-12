@@ -47,6 +47,7 @@ enum Opened {
 }
 
 struct Flow {
+    tracker: Option<Arc<crate::clash_state::ConnHandle>>,
     kind: FlowKind,
     last_ms: AtomicU64,
     timeout: Duration,
@@ -57,7 +58,7 @@ struct Flow {
 }
 
 enum FlowKind {
-    /// `action: hijack-dns` — stateless per-query exchange.
+    /// `action: hijack-dns` â€” stateless per-query exchange.
     Dns,
     /// Connected outbound socket + reverse pump to the client.
     Outbound { sock: Arc<UdpSocket> },
@@ -148,7 +149,7 @@ impl DatagramFrame {
     /// Frame `payload` for `dest` into `out` (cleared first).
     ///
     /// `Raw` needs no framing at all, so the send loops skip this entirely
-    /// and hand `send` the recv-buffer slice — a `to_vec()` per datagram
+    /// and hand `send` the recv-buffer slice â€” a `to_vec()` per datagram
     /// for a header of zero bytes.
     pub(crate) fn apply_into(self, dest: SocketAddr, payload: &[u8], out: &mut Vec<u8>) {
         out.clear();
@@ -347,7 +348,7 @@ impl UdpHub {
     }
 
     /// Fast path for the receive loops: an already-open outbound flow is fed
-    /// straight from the reader — `try_send` with no copy and no per-packet
+    /// straight from the reader â€” `try_send` with no copy and no per-packet
     /// task. Returns `false` when the flow is unknown (or is a DNS hijack,
     /// which needs the async exchange), and the caller should fall back to
     /// spawning the full [`UdpHub::handle`].
@@ -361,6 +362,14 @@ impl UdpHub {
         let Some(flow) = flow else {
             return false;
         };
+        if flow
+            .tracker
+            .as_ref()
+            .is_some_and(|tracker| tracker.is_closed())
+        {
+            self.flows.write().expect("flows").remove(&(source, dest));
+            return false;
+        }
         let FlowKind::Outbound { sock } = &flow.kind else {
             return false;
         };
@@ -418,7 +427,14 @@ impl UdpHub {
         let key = (source, dest);
         let found = {
             let map = self.flows.read().expect("flows");
-            map.get(&key).cloned()
+            map.get(&key)
+                .filter(|flow| {
+                    !flow
+                        .tracker
+                        .as_ref()
+                        .is_some_and(|tracker| tracker.is_closed())
+                })
+                .cloned()
         };
         let flow = match found {
             Some(flow) => {
@@ -427,7 +443,18 @@ impl UdpHub {
             }
             None => {
                 let _gate = self.gate(key).lock_owned().await;
-                let found = self.flows.read().expect("flows").get(&key).cloned();
+                let found = self
+                    .flows
+                    .read()
+                    .expect("flows")
+                    .get(&key)
+                    .filter(|flow| {
+                        !flow
+                            .tracker
+                            .as_ref()
+                            .is_some_and(|tracker| tracker.is_closed())
+                    })
+                    .cloned();
                 if let Some(existing) = found {
                     existing.touch();
                     existing
@@ -577,6 +604,7 @@ impl UdpHub {
         ));
         let flow = match decision {
             Decision::HijackDns => Flow {
+                tracker: None,
                 kind: FlowKind::Dns,
                 last_ms: AtomicU64::new(now_ms()),
                 timeout: self.timeout,
@@ -584,6 +612,11 @@ impl UdpHub {
                 writing: AtomicBool::new(false),
             },
             Decision::Outbound(idx) => {
+                let tracker = Arc::new(crate::clash_state::ConnHandle::open_with_context(
+                    super::clash_meta(&ctx, &self.router, idx),
+                    &ctx,
+                    &self.router,
+                ));
                 let target = if ctx.udp_disable_domain_unmapping == Some(false)
                     && let Some(orig) = &ctx.origin_destination
                 {
@@ -607,11 +640,13 @@ impl UdpHub {
                     timeout,
                     Arc::clone(self),
                     key,
+                    Some(Arc::clone(&tracker)),
                 );
                 let mut tasks = self.reverse_tasks.lock().expect("reverse tasks");
                 tasks.retain(|task| !task.is_finished());
                 tasks.push(task);
                 Flow {
+                    tracker: Some(tracker),
                     kind: FlowKind::Outbound { sock },
                     last_ms: AtomicU64::new(now_ms()),
                     timeout,
@@ -789,6 +824,7 @@ fn spawn_reverse(
     idle: Duration,
     hub: Arc<UdpHub>,
     key: FlowKey,
+    tracker: Option<Arc<crate::clash_state::ConnHandle>>,
 ) -> tokio::task::AbortHandle {
     let tag = tag.to_string();
     tokio::spawn(async move {
@@ -798,7 +834,17 @@ fn spawn_reverse(
         // touch it
         let mut out = Vec::new();
         loop {
-            match tokio::time::timeout(idle, outbound.recv(&mut buf)).await {
+            let recv = tokio::select! {
+                result = tokio::time::timeout(idle, outbound.recv(&mut buf)) => result,
+                _ = async {
+                    if let Some(tracker) = &tracker { tracker.close_signal().wait().await; }
+                    else { std::future::pending::<()>().await; }
+                } => {
+                    hub.remove_flow(key, &outbound).await;
+                    return;
+                }
+            };
+            match recv {
                 Ok(Ok(n)) => {
                     // Both directions count as activity. A receive-only media
                     // flow must keep its established proxy/NAT session.
@@ -827,7 +873,7 @@ fn spawn_reverse(
                     if hub.flow_is_active(key, &outbound) {
                         continue;
                     }
-                    // Idle timeout — drop the flow (reference udpnat purge).
+                    // Idle timeout â€” drop the flow (reference udpnat purge).
                     hub.remove_flow(key, &outbound).await;
                     return;
                 }
@@ -849,6 +895,69 @@ mod tests {
         .expect("direct router")
     }
 
+    #[tokio::test]
+    async fn removed_udp_rule_closes_flow_and_next_datagram_is_rerouted() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let source = reply.local_addr().unwrap();
+        let dest = server.local_addr().unwrap();
+        let root = serde_json::json!({"outbounds":[{"type":"direct","tag":"chosen"},{"type":"direct","tag":"fallback"}],"route":{"final":"fallback","rules":[{"ip_cidr":["127.0.0.1/32"],"outbound":"chosen"}]}});
+        let mut instance = crate::start(&root).await.unwrap();
+        let router = instance.router();
+        let hub = UdpHub::new(
+            Arc::clone(&router),
+            Duration::from_secs(60),
+            DatagramFrame::Raw,
+        );
+        hub.handle(
+            Reply::Socket(Arc::downgrade(&reply)),
+            source,
+            dest,
+            b"old",
+            "test",
+        )
+        .await
+        .unwrap();
+        let original = hub
+            .flows
+            .read()
+            .unwrap()
+            .get(&(source, dest))
+            .unwrap()
+            .tracker
+            .as_ref()
+            .unwrap()
+            .id();
+        let mut next = root.clone();
+        next["route"]["rules"] = serde_json::json!([]);
+        instance.reload_in_place(&next).await.unwrap();
+        let result = crate::clash_state::close_invalid_routes(&router).await;
+        assert!(result["closed"].as_u64().unwrap() > 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!hub.flows.read().unwrap().contains_key(&(source, dest)));
+        hub.handle(
+            Reply::Socket(Arc::downgrade(&reply)),
+            source,
+            dest,
+            b"new",
+            "test",
+        )
+        .await
+        .unwrap();
+        let tracker = hub
+            .flows
+            .read()
+            .unwrap()
+            .get(&(source, dest))
+            .unwrap()
+            .tracker
+            .as_ref()
+            .unwrap()
+            .id();
+        assert_ne!(original, tracker);
+        hub.stop();
+        instance.shutdown_wait().await;
+    }
     #[tokio::test]
     async fn reverse_traffic_keeps_a_receive_only_udp_flow_alive() {
         let server = UdpSocket::bind("127.0.0.1:0").await.expect("server");
@@ -913,6 +1022,7 @@ mod tests {
         hub.flows.write().expect("flows").insert(
             key,
             Arc::new(Flow {
+                tracker: None,
                 kind: FlowKind::Outbound { sock: replacement },
                 last_ms: AtomicU64::new(now_ms()),
                 timeout: Duration::from_secs(1),
@@ -929,6 +1039,7 @@ mod tests {
             Duration::from_millis(20),
             Arc::clone(&hub),
             key,
+            None,
         );
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(task.is_finished(), "old reverse task must finish");

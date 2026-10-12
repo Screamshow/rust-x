@@ -505,3 +505,64 @@ async fn changed_local_ruleset_applies_to_new_connections_and_keeps_live_tcp() {
     assert_eq!(instance.router().applied_config(), before);
     instance.shutdown_wait().await;
 }
+
+#[tokio::test]
+async fn connection_revalidation_handles_domains_cidrs_and_changed_list_entries() {
+    use core_runtime::{
+        clash_state::{self, ConnHandle},
+        inbound::clash_meta,
+        route::{ConnContext, Router, Target},
+    };
+    use std::sync::Arc;
+    let path = std::env::temp_dir().join(format!("rust-x-revalidate-{}.json", std::process::id()));
+    std::fs::write(
+        &path,
+        r#"{"version":1,"rules":[{"domain":["gone-list.test","keep-list.test"]}]}"#,
+    )
+    .unwrap();
+    let root = json!({"outbounds":[{"type":"direct","tag":"chosen"},{"type":"direct","tag":"fallback"}], "route":{"final":"fallback","rule_set":[{"type":"local","tag":"same-list","format":"source","path":path}],"rules":[{"domain":["gone.test","keep.test"],"outbound":"chosen"},{"ip_cidr":["198.51.100.0/24","203.0.113.0/24"],"outbound":"chosen"},{"rule_set":["same-list"],"outbound":"chosen"}]}});
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    let router: Arc<Router> = instance.router();
+    let mut handles = Vec::new();
+    for target in [
+        Target::Domain("gone.test".into(), 443),
+        Target::Domain("keep.test".into(), 443),
+        Target::Ip("198.51.100.5:443".parse().unwrap()),
+        Target::Ip("203.0.113.5:443".parse().unwrap()),
+        Target::Domain("gone-list.test".into(), 443),
+        Target::Domain("keep-list.test".into(), 443),
+    ] {
+        let mut ctx = ConnContext::new("mixed", "192.0.2.1:3000".parse().unwrap(), target, "tcp");
+        let core_runtime::route::Decision::Outbound(index) =
+            router.route_raw(&mut ctx).await.unwrap()
+        else {
+            panic!()
+        };
+        handles.push(ConnHandle::open_with_context(
+            clash_meta(&ctx, &router, index),
+            &ctx,
+            &router,
+        ));
+    }
+    std::fs::write(
+        &path,
+        r#"{"version":1,"rules":[{"domain":["keep-list.test"]}]}"#,
+    )
+    .unwrap();
+    let mut next = root.clone();
+    next["route"]["rules"][0]["domain"] = json!(["keep.test"]);
+    next["route"]["rules"][1]["ip_cidr"] = json!(["203.0.113.0/24"]);
+    instance.reload_in_place(&next).await.unwrap();
+    let result = clash_state::close_invalid_routes(&router).await;
+    assert_eq!(result["closed"], 3);
+    assert_eq!(result["skipped"], 0);
+    for (i, h) in handles.iter().enumerate() {
+        let closed = timeout(Duration::from_millis(10), h.close_signal().wait())
+            .await
+            .is_ok();
+        assert_eq!(closed, i % 2 == 0, "connection {i}");
+    }
+    drop(handles);
+    instance.shutdown_wait().await;
+    std::fs::remove_file(path).unwrap();
+}

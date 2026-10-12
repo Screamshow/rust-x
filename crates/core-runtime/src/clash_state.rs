@@ -31,6 +31,8 @@ pub struct ConnMeta {
 struct Shared {
     id: u64,
     meta: ConnMeta,
+    routing: Option<crate::route::ConnContext>,
+    scope: Option<Arc<()>>,
     start: Instant,
     upload: AtomicU64,
     download: AtomicU64,
@@ -78,10 +80,31 @@ pub struct ConnHandle {
 
 impl ConnHandle {
     pub fn open(meta: ConnMeta) -> Self {
+        Self::open_inner(meta, None, None)
+    }
+
+    pub fn open_with_context(
+        meta: ConnMeta,
+        ctx: &crate::route::ConnContext,
+        router: &crate::route::Router,
+    ) -> Self {
+        let mut routing = ctx.clone();
+        // Routing evidence is sufficient; never retain buffered user traffic.
+        routing.sniff_prefix = Vec::new();
+        Self::open_inner(meta, Some(routing), Some(router.connection_scope()))
+    }
+
+    fn open_inner(
+        meta: ConnMeta,
+        routing: Option<crate::route::ConnContext>,
+        scope: Option<Arc<()>>,
+    ) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
             id,
             meta,
+            routing,
+            scope,
             start: Instant::now(),
             upload: AtomicU64::new(0),
             download: AtomicU64::new(0),
@@ -104,6 +127,10 @@ impl ConnHandle {
             closed: Arc::clone(&self.shared.closed),
             notify: Arc::clone(&self.shared.notify),
         }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
     }
 
     pub fn add_upload(&self, bytes: u64) {
@@ -182,6 +209,94 @@ pub fn close_all() -> usize {
         trigger(&entry.closed, &entry.notify);
     }
     entries.len()
+}
+
+/// Re-evaluate tracked sessions using one coherent routing snapshot. No dial
+/// occurs; ordinary DNS/route actions run on copies of the captured context.
+pub async fn close_invalid_routes(router: &crate::route::Router) -> serde_json::Value {
+    use crate::route::Decision;
+    let entries: Vec<_> = registry()
+        .lock()
+        .map(|guard| guard.values().cloned().collect())
+        .unwrap_or_default();
+    let snapshot = router.inner();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut invalid = Vec::new();
+    let mut skipped = 0usize;
+    for entry in entries {
+        if !entry
+            .scope
+            .as_ref()
+            .is_some_and(|scope| Arc::ptr_eq(scope, &router.connection_scope()))
+        {
+            continue;
+        }
+        let Some(mut ctx) = entry.routing.clone() else {
+            continue;
+        };
+        let original_destination = ctx.destination.to_string();
+        if let Some(original) = ctx.route_original_destination.take() {
+            ctx.destination = original;
+        }
+        let had_destination_rule = !entry.meta.rule_payload.is_empty();
+        ctx.matched_rule = None;
+        let current = Arc::clone(&snapshot);
+        tasks.spawn(async move {
+            let decision = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                current.route_walk::<tokio::net::TcpStream>(None, &mut ctx),
+            )
+            .await;
+            let changed = match decision {
+                Ok(Ok(Decision::Outbound(index))) => {
+                    let tag = current
+                        .outbound_table()
+                        .find(|(i, _, _)| *i == index)
+                        .map(|(_, tag, _)| tag);
+                    let still_destination_rule = ctx
+                        .matched_rule
+                        .as_ref()
+                        .is_some_and(|(_, payload)| !payload.is_empty());
+                    Some(
+                        tag != entry.meta.chains.first().map(String::as_str)
+                            || ctx.destination.to_string() != original_destination
+                            || (had_destination_rule && !still_destination_rule),
+                    )
+                }
+                Ok(Ok(Decision::HijackDns)) => Some(true),
+                Ok(Err(_))
+                    if ctx
+                        .matched_rule
+                        .as_ref()
+                        .is_some_and(|(rule, _)| rule.contains("=> reject")) =>
+                {
+                    Some(true)
+                }
+                _ => None,
+            };
+            (entry.id, changed)
+        });
+        if tasks.len() >= 16 {
+            match tasks.join_next().await {
+                Some(Ok((id, Some(true)))) => invalid.push(id),
+                Some(Ok((_, Some(false)))) => {}
+                _ => skipped += 1,
+            }
+        }
+    }
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((id, Some(true))) => invalid.push(id),
+            Ok((_, Some(false))) => {}
+            _ => skipped += 1,
+        }
+    }
+    // Another reload must not make this evaluation close current sessions.
+    if !Arc::ptr_eq(&snapshot, &router.inner()) {
+        return serde_json::json!({"closed":0,"skipped":skipped,"superseded":true});
+    }
+    let closed = invalid.into_iter().filter(|id| close(*id)).count();
+    serde_json::json!({"closed":closed,"skipped":skipped,"superseded":false})
 }
 
 /// Count UDP payload bytes so `/traffic` sees datagram traffic too.

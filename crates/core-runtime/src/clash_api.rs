@@ -491,6 +491,10 @@ async fn handle_request(
         Route::AppliedConfig => {
             respond_json(stream, 200, "OK", &router.applied_config(), &cors).await?;
         }
+        Route::RevalidateConnections => {
+            let body = clash_state::close_invalid_routes(router).await;
+            respond_json(stream, 200, "OK", &body, &cors).await?;
+        }
         Route::Configs => {
             return handle_configs(stream, method, &headers, api, &cors).await;
         }
@@ -524,6 +528,7 @@ enum Route {
     Rules,
     Configs,
     AppliedConfig,
+    RevalidateConnections,
     Providers,
     /// `/ui`: the permanent redirect to `/ui/`
     UiRoot,
@@ -539,6 +544,7 @@ fn classify_with_ui(path: &str, external_ui: bool) -> (Route, &'static [&'static
         "/" => (Route::Root, GET_ONLY),
         "/version" => (Route::Version, GET_ONLY),
         "/rust-x/applied-config" => (Route::AppliedConfig, GET_ONLY),
+        "/rust-x/revalidate-connections" => (Route::RevalidateConnections, &["POST"]),
         "/proxies" | "/proxies/" => (Route::Proxies, GET_ONLY),
         "/logs" => (Route::Logs, GET_ONLY),
         "/traffic" => (Route::Traffic, GET_ONLY),

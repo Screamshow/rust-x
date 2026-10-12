@@ -254,6 +254,14 @@ async fn applied_config_is_authenticated_and_acknowledges_complete_reload() {
     let addr = instance.clash_api_addr().unwrap();
     let (head, _) = request(addr, &get("/rust-x/applied-config")).await;
     assert!(head.contains("401"));
+    let (head, _) = request(addr, "POST /rust-x/revalidate-connections HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+    assert!(head.contains("401"));
+    let (head, body) = request(addr, "POST /rust-x/revalidate-connections HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer reload-test-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+    assert!(head.contains("200"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["skipped"],
+        0
+    );
     let raw = "GET /rust-x/applied-config HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer reload-test-secret\r\nConnection: close\r\n\r\n";
     let (head, body) = request(addr, raw).await;
     assert!(head.contains("200"));
