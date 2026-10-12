@@ -34,6 +34,7 @@ use crate::route::Router;
 /// A started box instance: running inbound listeners plus their tasks.
 pub struct BoxInstance {
     router: Arc<Router>,
+    reload_boundary: Value,
     tasks: Vec<JoinHandle<()>>,
     inbounds: Vec<(String, SocketAddr)>,
     dns: Option<Arc<dns::DnsService>>,
@@ -123,8 +124,11 @@ impl BoxInstance {
     }
 
     /// Perform in-place hot reload without stopping inbounds or dropping connections.
-    /// Perform in-place hot reload without stopping inbounds or dropping connections.
     pub async fn reload_in_place(&mut self, new_root: &Value) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            can_reload_in_place(&self.reload_boundary, new_root),
+            "configuration changes listeners or other restart-only settings"
+        );
         warn_unhonored_options(new_root);
 
         // 1. Build and validate new router inner BEFORE mutating anything running
@@ -178,6 +182,7 @@ impl BoxInstance {
             logging::set_level(lvl);
         }
         logging::set_enabled(!disabled);
+        self.router.record_applied_config(new_root);
 
         Ok(())
     }
@@ -462,8 +467,10 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
             }
         }));
     }
+    router.record_applied_config(root);
     Ok(BoxInstance {
         router,
+        reload_boundary: reload_boundary(root),
         tasks: std::mem::take(tasks),
         inbounds,
         dns: dns_service,
@@ -511,6 +518,35 @@ async fn reload_instance(
     }
 }
 
+// Keep only immutable runtime settings, not a second copy of subscriptions.
+fn reload_boundary(root: &Value) -> Value {
+    let mut boundary = serde_json::Map::new();
+    for key in ["inbounds", "ntp", "network_namespaces"] {
+        if let Some(value) = root.get(key) {
+            boundary.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(experimental) = root.get("experimental") {
+        let mut immutable = serde_json::Map::new();
+        for key in ["clash_api", "cache_file"] {
+            if let Some(value) = experimental.get(key) {
+                immutable.insert(key.into(), value.clone());
+            }
+        }
+        boundary.insert("experimental".into(), Value::Object(immutable));
+    }
+    Value::Object(boundary)
+}
+
+/// Canonical parsed-config identity shared by the CLI planner and live API.
+pub fn configuration_fingerprint(root: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(root).expect("config JSON"))
+    )
+}
+
 pub fn can_reload_in_place(old_root: &Value, new_root: &Value) -> bool {
     if old_root.get("inbounds") != new_root.get("inbounds") {
         return false;
@@ -522,6 +558,14 @@ pub fn can_reload_in_place(old_root: &Value, new_root: &Value) -> bool {
         .get("experimental")
         .and_then(|e| e.get("clash_api"));
     if old_clash != new_clash {
+        return false;
+    }
+    let cache = |root: &Value| {
+        root.get("experimental")
+            .and_then(|e| e.get("cache_file"))
+            .cloned()
+    };
+    if cache(old_root) != cache(new_root) {
         return false;
     }
     #[cfg(target_os = "linux")]

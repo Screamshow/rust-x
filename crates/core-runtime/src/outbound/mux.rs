@@ -184,6 +184,52 @@ impl AsyncRead for MuxStream {
     }
 }
 
+// Header progress belongs to the stream, payload progress to the caller.
+// Continue after a header-only write: returning Ok(0) here would make
+// write_all report WriteZero even though the underlying stream made progress.
+fn poll_request_write<W: AsyncWrite + Unpin>(
+    inner: &mut W,
+    request: &mut Option<Vec<u8>>,
+    cx: &mut std::task::Context<'_>,
+    buf: &[u8],
+) -> std::task::Poll<io::Result<usize>> {
+    use std::task::Poll;
+    if buf.is_empty() {
+        return Poll::Ready(Ok(0));
+    }
+    while let Some(header) = request.take() {
+        let header_len = header.len();
+        let mut first = header;
+        first.extend_from_slice(buf);
+        match std::pin::Pin::new(&mut *inner).poll_write(cx, &first) {
+            Poll::Ready(Ok(0)) => {
+                first.truncate(header_len);
+                *request = Some(first);
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            Poll::Ready(Ok(n)) if n <= header_len => {
+                first.truncate(header_len);
+                first.drain(..n);
+                if !first.is_empty() {
+                    *request = Some(first);
+                }
+            }
+            Poll::Ready(Ok(n)) => return Poll::Ready(Ok(n - header_len)),
+            Poll::Ready(Err(error)) => {
+                first.truncate(header_len);
+                *request = Some(first);
+                return Poll::Ready(Err(error));
+            }
+            Poll::Pending => {
+                first.truncate(header_len);
+                *request = Some(first);
+                return Poll::Pending;
+            }
+        }
+    }
+    std::pin::Pin::new(inner).poll_write(cx, buf)
+}
+
 impl AsyncWrite for MuxStream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -191,22 +237,7 @@ impl AsyncWrite for MuxStream {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         let this = &mut *self;
-        if let Some(request) = this.request.take() {
-            // the request rides in front of the first write, like the reference
-            let mut first = request.clone();
-            first.extend_from_slice(buf);
-            match std::pin::Pin::new(&mut this.inner).poll_write(cx, &first) {
-                std::task::Poll::Ready(Ok(_)) => {
-                    return std::task::Poll::Ready(Ok(buf.len()));
-                }
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
-                std::task::Poll::Pending => {
-                    this.request = Some(request);
-                    return std::task::Poll::Pending;
-                }
-            }
-        }
-        std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+        poll_request_write(&mut this.inner, &mut this.request, cx, buf)
     }
 
     fn poll_flush(
@@ -616,6 +647,89 @@ pub fn mux_target() -> Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ShortWriter {
+        steps: std::collections::VecDeque<Option<usize>>,
+        bytes: Vec<u8>,
+    }
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            match self.steps.pop_front().unwrap_or(Some(buf.len())) {
+                None => {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                Some(n) => {
+                    let n = n.min(buf.len());
+                    self.bytes.extend_from_slice(&buf[..n]);
+                    std::task::Poll::Ready(Ok(n))
+                }
+            }
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn first_request_survives_short_header_payload_and_pending_writes() {
+        for steps in [
+            vec![Some(1), None, Some(3), Some(2)],
+            vec![Some(4), None, Some(1)],
+            vec![None, Some(6)],
+        ] {
+            let mut writer = ShortWriter {
+                steps: steps.into(),
+                bytes: vec![],
+            };
+            let mut header = Some(b"HEAD".to_vec());
+            let mut payload = &b"payload"[..];
+            while !payload.is_empty() {
+                let n = std::future::poll_fn(|cx| {
+                    poll_request_write(&mut writer, &mut header, cx, payload)
+                })
+                .await
+                .unwrap();
+                assert!(n > 0 && n <= payload.len());
+                payload = &payload[n..];
+            }
+            assert_eq!(writer.bytes, b"HEADpayload");
+            assert!(header.is_none());
+        }
+    }
+
+    #[test]
+    fn zero_write_is_an_error_and_empty_write_preserves_header() {
+        let mut writer = ShortWriter {
+            steps: [Some(0)].into(),
+            bytes: vec![],
+        };
+        let mut header = Some(b"HEAD".to_vec());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            poll_request_write(&mut writer, &mut header, &mut cx, b""),
+            std::task::Poll::Ready(Ok(0))
+        ));
+        assert_eq!(header.as_deref(), Some(&b"HEAD"[..]));
+        match poll_request_write(&mut writer, &mut header, &mut cx, b"payload") {
+            std::task::Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::WriteZero),
+            _ => panic!("zero write must be rejected"),
+        }
+        assert_eq!(header.as_deref(), Some(&b"HEAD"[..]));
+    }
 
     #[test]
     fn options_default_to_eight_streams_per_session() {

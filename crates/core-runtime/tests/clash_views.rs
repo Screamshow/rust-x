@@ -244,3 +244,39 @@ async fn data_views_answer_over_http() {
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("\"up\""), "{text}");
 }
+
+#[tokio::test]
+async fn applied_config_is_authenticated_and_acknowledges_complete_reload() {
+    let _guard = guard().lock().await;
+    let mut root = api_config();
+    root["experimental"]["clash_api"]["secret"] = serde_json::json!("reload-test-secret");
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    let addr = instance.clash_api_addr().unwrap();
+    let (head, _) = request(addr, &get("/rust-x/applied-config")).await;
+    assert!(head.contains("401"));
+    let raw = "GET /rust-x/applied-config HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer reload-test-secret\r\nConnection: close\r\n\r\n";
+    let (head, body) = request(addr, raw).await;
+    assert!(head.contains("200"));
+    let before: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(before["generation"], 1);
+    assert_eq!(before["config_sha256"].as_str().unwrap().len(), 64);
+    assert!(
+        !String::from_utf8(body)
+            .unwrap()
+            .contains("reload-test-secret")
+    );
+    root["route"]["final"] = serde_json::json!("block");
+    instance.reload_in_place(&root).await.unwrap();
+    let (_, body) = request(addr, raw).await;
+    let after: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(after["generation"], 2);
+    assert_eq!(after["pid"], before["pid"]);
+    assert_ne!(after["config_sha256"], before["config_sha256"]);
+    instance.reload_in_place(&root).await.unwrap();
+    assert_eq!(instance.router().applied_config()["generation"], 3);
+    assert_eq!(
+        instance.router().applied_config()["config_sha256"],
+        after["config_sha256"]
+    );
+    instance.shutdown_wait().await;
+}

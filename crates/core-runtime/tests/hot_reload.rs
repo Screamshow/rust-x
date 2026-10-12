@@ -121,7 +121,7 @@ async fn hot_reload_preserves_live_tcp_connections() {
             "type": "mixed",
             "tag": "mixed-in",
             "listen": "127.0.0.1",
-            "listen_port": in_addr.port()
+            "listen_port": 0
         }],
         "outbounds": [
             {"type": "direct", "tag": "d1"},
@@ -193,8 +193,6 @@ async fn hot_reload_preserves_selector_urltest_and_dns_cache() {
 
     let mut instance = core_runtime::start(&root1).await.expect("start box");
     let router = instance.router();
-    let in_addr = instance.inbound_addrs()[0].1;
-
     // Record delay on d2, select d2 in selector
     let d2 = router.index_of("d2").unwrap();
     router.record_delay(d2, 88);
@@ -219,7 +217,7 @@ async fn hot_reload_preserves_selector_urltest_and_dns_cache() {
             "type": "mixed",
             "tag": "in",
             "listen": "127.0.0.1",
-            "listen_port": in_addr.port()
+            "listen_port": 0
         }],
         "outbounds": [
             {"type": "direct", "tag": "d3"},
@@ -291,7 +289,7 @@ async fn hot_reload_failure_keeps_running_instance_untouched() {
             "type": "mixed",
             "tag": "in",
             "listen": "127.0.0.1",
-            "listen_port": in_addr.port()
+            "listen_port": 0
         }],
         "dns": {
             "servers": [
@@ -325,4 +323,185 @@ async fn hot_reload_failure_keeps_running_instance_untouched() {
     assert_eq!(&buf2, b"still_working_after_failure");
 
     instance.shutdown();
+}
+
+#[tokio::test]
+async fn reload_acknowledges_only_success_and_rejects_listener_changes() {
+    let root = json!({"inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":0}],
+        "outbounds":[{"type":"direct","tag":"old"}],"route":{"final":"old"}});
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    let router = instance.router();
+    let before = router.applied_config();
+    assert_eq!(before["generation"], 1);
+    let mut next = root.clone();
+    next["inbounds"][0]["listen_port"] = json!(12345);
+    assert!(instance.reload_in_place(&next).await.is_err());
+    assert_eq!(router.applied_config(), before);
+    next = root.clone();
+    next["route"]["final"] = json!("missing");
+    assert!(instance.reload_in_place(&next).await.is_err());
+    assert_eq!(router.applied_config(), before);
+    next = root.clone();
+    next["outbounds"][0]["tag"] = json!("new");
+    next["route"]["final"] = json!("new");
+    instance.reload_in_place(&next).await.unwrap();
+    let after = router.applied_config();
+    assert_eq!(after["generation"], 2);
+    assert_ne!(after["config_sha256"], before["config_sha256"]);
+    assert_eq!(after["pid"], before["pid"]);
+    assert_eq!(router.default_tag(), "new");
+    assert!(!core_runtime::can_reload_in_place(
+        &next,
+        &json!({"experimental":{"cache_file":{"enabled":true}}})
+    ));
+    instance.shutdown_wait().await;
+}
+
+#[tokio::test]
+async fn changed_dns_server_with_same_tag_does_not_reuse_old_answer() {
+    let root = json!({
+        "dns":{"servers":[{"type":"hosts","tag":"main","path":[],
+            "predefined":{"reload.example":["203.0.113.7"]}}],"final":"main"},
+        "outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}
+    });
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    let before = instance
+        .dns()
+        .unwrap()
+        .resolve("reload.example")
+        .await
+        .unwrap();
+    assert_eq!(before[0].to_string(), "203.0.113.7");
+    let mut next = root.clone();
+    next["dns"]["servers"][0]["predefined"]["reload.example"] = json!(["203.0.113.8"]);
+    instance.reload_in_place(&next).await.unwrap();
+    let after = instance
+        .dns()
+        .unwrap()
+        .resolve("reload.example")
+        .await
+        .unwrap();
+    assert_eq!(after[0].to_string(), "203.0.113.8");
+    instance.shutdown_wait().await;
+}
+
+#[tokio::test]
+async fn changed_udp_resolver_does_not_migrate_cached_answer() {
+    async fn responder(ip: [u8; 4]) -> (u16, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let mut reply = buf[..n].to_vec();
+                reply[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+                let a = reply[n - 4..n - 2] == [0, 1];
+                reply[6..8].copy_from_slice(&(u16::from(a)).to_be_bytes());
+                if a {
+                    reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4]);
+                    reply.extend_from_slice(&ip);
+                }
+                socket.send_to(&reply, peer).await.unwrap();
+            }
+        });
+        (port, task)
+    }
+    let (first, task1) = responder([203, 0, 113, 7]).await;
+    let (second, task2) = responder([203, 0, 113, 8]).await;
+    let root = json!({"dns":{"servers":[{"type":"udp","tag":"main","server":"127.0.0.1","server_port":first}],"final":"main","strategy":"ipv4_only"},
+        "outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}});
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    assert_eq!(
+        instance
+            .dns()
+            .unwrap()
+            .resolve("reload.example")
+            .await
+            .unwrap()[0]
+            .to_string(),
+        "203.0.113.7"
+    );
+    let mut next = root.clone();
+    next["dns"]["servers"][0]["server_port"] = json!(second);
+    instance.reload_in_place(&next).await.unwrap();
+    assert_eq!(
+        instance
+            .dns()
+            .unwrap()
+            .resolve("reload.example")
+            .await
+            .unwrap()[0]
+            .to_string(),
+        "203.0.113.8"
+    );
+    instance.shutdown_wait().await;
+    task1.abort();
+    task2.abort();
+}
+
+#[tokio::test]
+async fn changed_local_ruleset_applies_to_new_connections_and_keeps_live_tcp() {
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "rust-x-hot-list-{}-{nonce}.json",
+        std::process::id()
+    ));
+    let _cleanup = Cleanup(path.clone());
+    std::fs::write(
+        &path,
+        r#"{"version":3,"rules":[{"ip_cidr":["192.0.2.0/24"]}]}"#,
+    )
+    .unwrap();
+    let echo = spawn_echo().await;
+    let root = json!({
+        "inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":0}],
+        "outbounds":[{"type":"direct","tag":"direct"}],
+        "route":{"final":"direct","rule_set":[{"type":"local","tag":"list","format":"source","path":path}],
+            "rules":[{"rule_set":["list"],"action":"reject"}]}
+    });
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    let addr = instance.inbound_addrs()[0].1;
+    let mut live = TcpStream::connect(addr).await.unwrap();
+    socks5_handshake(&mut live, echo).await;
+    std::fs::write(
+        &path,
+        r#"{"version":3,"rules":[{"ip_cidr":["127.0.0.1/32"]}]}"#,
+    )
+    .unwrap();
+    instance.reload_in_place(&root).await.unwrap();
+    live.write_all(b"still-live").await.unwrap();
+    let mut received = [0; 10];
+    timeout(T, live.read_exact(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&received, b"still-live");
+    let mut next = TcpStream::connect(addr).await.unwrap();
+    next.write_all(&[5, 1, 0]).await.unwrap();
+    let mut method = [0; 2];
+    next.read_exact(&mut method).await.unwrap();
+    assert_eq!(method, [5, 0]);
+    let mut req = vec![5, 1, 0, 1, 127, 0, 0, 1];
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    next.write_all(&req).await.unwrap();
+    let mut reply = [0; 10];
+    timeout(T, next.read_exact(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(reply[1], 0, "new connection bypassed updated rule set");
+    let before = instance.router().applied_config();
+    std::fs::write(&path, "{broken").unwrap();
+    assert!(instance.reload_in_place(&root).await.is_err());
+    assert_eq!(instance.router().applied_config(), before);
+    instance.shutdown_wait().await;
 }

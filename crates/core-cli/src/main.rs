@@ -241,6 +241,35 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("run: {e:#}"))
 }
 
+// Read-only planning: do not start listeners, load remote sets or duplicate a
+// running data plane merely to compute its expected acknowledgment.
+fn cmd_reload_plan(args: &[String]) -> Result<(), String> {
+    let current = args
+        .windows(2)
+        .find(|pair| pair[0] == "--current")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .ok_or("reload-plan: missing --current <path>")?;
+    let raw = load_config(args)?;
+    core_config::check_str(&raw)
+        .map_err(|_| "reload-plan: candidate configuration rejected".to_string())?;
+    let next: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|_| "reload-plan: invalid candidate JSON")?;
+    let previous: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(current)
+            .map_err(|_| "reload-plan: cannot read current configuration")?,
+    )
+    .map_err(|_| "reload-plan: invalid current JSON")?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": 1, "in_place": core_runtime::can_reload_in_place(&previous, &next),
+            "current_sha256": core_runtime::configuration_fingerprint(&previous),
+            "config_sha256": core_runtime::configuration_fingerprint(&next)
+        })
+    );
+    Ok(())
+}
+
 /// `api <method> <path> [body]` against our own Clash REST controller
 /// (`--url`, `--secret`; defaults `BOX_API_URL` / `BOX_API_SECRET`). The
 /// reference ships a gRPC client for its daemon service, which belongs to the
@@ -669,6 +698,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         "check" => cmd_check(&cmd_args),
+        "reload-plan" => cmd_reload_plan(&cmd_args),
         "run" => cmd_run(&cmd_args),
         "api" => cmd_api(&cmd_args),
         "generate" => cmd_generate(&cmd_args),

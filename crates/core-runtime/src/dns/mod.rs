@@ -68,6 +68,9 @@ impl Strategy {
 }
 
 pub struct DnsService {
+    // Resolver tags are not identities: a reload can change the server behind
+    // the same tag. Keep answer/bootstrap caches only for unchanged DNS policy.
+    cache_identity: [u8; 32],
     servers: HashMap<String, Arc<ServerConfig>>,
     rules: Vec<Rule>,
     final_tag: String,
@@ -259,6 +262,10 @@ impl DnsService {
         let client_subnet = parse_client_subnet(map.get("client_subnet"))?;
 
         Ok(Some(Arc::new(Self {
+            cache_identity: {
+                use sha2::{Digest, Sha256};
+                Sha256::digest(serde_json::to_vec(dns)?).into()
+            },
             servers,
             rules,
             final_tag,
@@ -280,11 +287,14 @@ impl DnsService {
     /// Migrate active cache, server addresses, reverse mappings, and fakeip pools from an earlier DNS service.
     pub fn migrate_from(&self, old: &DnsService) {
         let now = Instant::now();
-        if let (Ok(old_cache), Ok(mut new_cache)) = (old.cache.read(), self.cache.write()) {
+        if self.cache_identity == old.cache_identity
+            && let (Ok(old_cache), Ok(mut new_cache)) = (old.cache.read(), self.cache.write())
+        {
             old_cache.copy_valid_into(&mut new_cache, now);
         }
-        if let (Ok(old_addrs), Ok(mut new_addrs)) =
-            (old.server_addrs.lock(), self.server_addrs.lock())
+        if self.cache_identity == old.cache_identity
+            && let (Ok(old_addrs), Ok(mut new_addrs)) =
+                (old.server_addrs.lock(), self.server_addrs.lock())
         {
             for (k, (addr, valid_until)) in old_addrs.iter() {
                 if valid_until.elapsed() < SERVER_ADDR_TTL {

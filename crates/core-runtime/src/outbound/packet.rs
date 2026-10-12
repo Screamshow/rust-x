@@ -154,44 +154,63 @@ impl PacketWriter {
         Self { mode, named: false }
     }
 
-    pub(crate) fn frame(&mut self, target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
+    pub(crate) fn frame_into(
+        &mut self,
+        target: &Target,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
         if payload.len() > u16::MAX as usize {
             return Err(io::Error::other("datagram too large"));
         }
-        let mut out = Vec::with_capacity(payload.len() + MAX_ADDR_PORT + 16);
+        out.clear();
         match self.mode {
             PacketEncoding::LengthPrefixed => {
+                out.reserve(payload.len() + 2);
                 out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 out.extend_from_slice(payload);
             }
             PacketEncoding::PacketAddr => {
-                // the address rides inside the length-prefixed frame, so the
-                // stream framing stays unambiguous
-                let mut body = Vec::with_capacity(MAX_ADDR_PORT + payload.len());
-                put_addr_port(&mut body, target)?;
-                body.extend_from_slice(payload);
-                out.extend_from_slice(&(body.len() as u16).to_be_bytes());
-                out.extend_from_slice(&body);
+                let len_offset = out.len();
+                out.extend_from_slice(&[0, 0]);
+                let body_start = out.len();
+                put_addr_port(out, target)?;
+                out.extend_from_slice(payload);
+                let body_len = out.len() - body_start;
+                if body_len > u16::MAX as usize {
+                    return Err(io::Error::other("datagram too large"));
+                }
+                let len_bytes = (body_len as u16).to_be_bytes();
+                out[len_offset..len_offset + 2].copy_from_slice(&len_bytes);
             }
             PacketEncoding::Xudp => {
-                let mut meta = Vec::with_capacity(MAX_ADDR_PORT + 8);
-                meta.extend_from_slice(&[0, 0]); // mux session id
+                let meta_len_offset = out.len();
+                out.extend_from_slice(&[0, 0]);
+                let meta_start = out.len();
+                out.extend_from_slice(&[0, 0]); // mux session id
                 if self.named {
-                    meta.extend_from_slice(&[2, 1]); // Keep, opt
+                    out.extend_from_slice(&[2, 1]); // Keep, opt
                 } else {
-                    meta.extend_from_slice(&[1, 1, 2]); // New, opt, udp
-                    let address_start = meta.len();
-                    put_addr_port(&mut meta, target)?;
-                    // Xray common/xudp uses PortThenAddress, unlike packetaddr.
-                    meta[address_start..].rotate_right(2);
+                    out.extend_from_slice(&[1, 1, 2]); // New, opt, udp
+                    let address_start = out.len();
+                    put_addr_port(out, target)?;
+                    out[address_start..].rotate_right(2);
                     self.named = true;
                 }
-                out.extend_from_slice(&(meta.len() as u16).to_be_bytes());
-                out.extend_from_slice(&meta);
+                let meta_len = out.len() - meta_start;
+                let meta_len_bytes = (meta_len as u16).to_be_bytes();
+                out[meta_len_offset..meta_len_offset + 2].copy_from_slice(&meta_len_bytes);
                 out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 out.extend_from_slice(payload);
             }
         }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn frame(&mut self, target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(payload.len() + MAX_ADDR_PORT + 16);
+        self.frame_into(target, payload, &mut out)?;
         Ok(out)
     }
 }
@@ -306,14 +325,15 @@ fn spawn_packet_bridge_with_timeout(
     let mut out = PacketWriter::new(mode);
     let upstream = async move {
         let mut buf = vec![0u8; MAX_DATAGRAM];
+        let mut framed = Vec::new();
         loop {
             let Ok(n) = in_socket.recv(&mut buf).await else {
                 break;
             };
             sent.send_replace(tokio::time::Instant::now());
-            let Ok(framed) = out.frame(&target, &buf[..n]) else {
+            if out.frame_into(&target, &buf[..n], &mut framed).is_err() {
                 break;
-            };
+            }
             if writer.write_all(&framed).await.is_err() {
                 break;
             }
@@ -358,6 +378,27 @@ pub(crate) async fn wait_bridge_idle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packetaddr_length_includes_destination_and_scratch_is_reused() {
+        let target = Target::Ip("127.0.0.1:53".parse().unwrap());
+        let mut writer = PacketWriter::new(PacketEncoding::PacketAddr);
+        let mut scratch = Vec::new();
+        let payload = vec![0x5a; u16::MAX as usize - 7];
+        writer.frame_into(&target, &payload, &mut scratch).unwrap();
+        assert_eq!(&scratch[..2], &u16::MAX.to_be_bytes());
+        let pointer = scratch.as_ptr();
+        let capacity = scratch.capacity();
+        writer.frame_into(&target, b"next", &mut scratch).unwrap();
+        assert_eq!(scratch.as_ptr(), pointer);
+        assert_eq!(scratch.capacity(), capacity);
+        assert_eq!(&scratch[9..], b"next");
+        assert!(
+            writer
+                .frame_into(&target, &vec![0; u16::MAX as usize - 6], &mut scratch)
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn packet_bridge_releases_abandoned_udp_socket_with_open_tunnel() {

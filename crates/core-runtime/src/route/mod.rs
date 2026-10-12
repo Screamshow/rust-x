@@ -761,6 +761,7 @@ pub struct RouterInner {
 
 pub struct Router {
     inner: std::sync::RwLock<Arc<RouterInner>>,
+    applied_config: std::sync::Mutex<Value>,
 }
 
 /// A `local` DNS server with `neighbor_domain` answers from the same tables.
@@ -1153,6 +1154,7 @@ impl Router {
     pub(crate) fn prepare(root: &Value) -> anyhow::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             inner: std::sync::RwLock::new(Arc::new(RouterInner::build(root)?)),
+            applied_config: std::sync::Mutex::new(serde_json::json!({"generation": 0})),
         }))
     }
 
@@ -1160,6 +1162,7 @@ impl Router {
         let inner = RouterInner::build(root)?;
         let router = Arc::new(Router {
             inner: std::sync::RwLock::new(Arc::new(inner)),
+            applied_config: std::sync::Mutex::new(serde_json::json!({"generation": 0})),
         });
         let inner_ref = router.inner();
         for outbound in &inner_ref.outbounds {
@@ -1185,6 +1188,22 @@ impl Router {
             .as_ref()
             .expect("route registry built in Router::new")
             .clone()
+    }
+
+    /// Published only after startup or a complete in-place apply succeeds.
+    pub fn applied_config(&self) -> Value {
+        self.applied_config.lock().expect("applied config").clone()
+    }
+
+    pub(crate) fn record_applied_config(&self, root: &Value) {
+        let hash = crate::configuration_fingerprint(root);
+        let mut state = self.applied_config.lock().expect("applied config");
+        let generation = state["generation"].as_u64().unwrap_or(0) + 1;
+        *state = serde_json::json!({
+            "pid": std::process::id(), "generation": generation,
+            "config_sha256": hash, "ready": true,
+            "hot_reload": true, "schema": 1
+        });
     }
 
     pub fn defaults(&self) -> RouteDefaults {

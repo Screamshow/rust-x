@@ -488,6 +488,9 @@ async fn handle_request(
             let body = rules_view(router);
             respond_json(stream, 200, "OK", &body, &cors).await?;
         }
+        Route::AppliedConfig => {
+            respond_json(stream, 200, "OK", &router.applied_config(), &cors).await?;
+        }
         Route::Configs => {
             return handle_configs(stream, method, &headers, api, &cors).await;
         }
@@ -520,6 +523,7 @@ enum Route {
     Connection(u64),
     Rules,
     Configs,
+    AppliedConfig,
     Providers,
     /// `/ui`: the permanent redirect to `/ui/`
     UiRoot,
@@ -534,6 +538,7 @@ fn classify_with_ui(path: &str, external_ui: bool) -> (Route, &'static [&'static
     match path {
         "/" => (Route::Root, GET_ONLY),
         "/version" => (Route::Version, GET_ONLY),
+        "/rust-x/applied-config" => (Route::AppliedConfig, GET_ONLY),
         "/proxies" | "/proxies/" => (Route::Proxies, GET_ONLY),
         "/logs" => (Route::Logs, GET_ONLY),
         "/traffic" => (Route::Traffic, GET_ONLY),
