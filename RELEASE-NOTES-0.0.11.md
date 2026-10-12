@@ -1,4 +1,4 @@
-Rust X 0.0.12
+Rust X 0.0.11
 
 - Add authenticated connection revalidation after a successful routing apply, closing affected TCP and UDP sessions when their destination or outbound changes or their destination rule no longer matches.
 - Support removed inline domains and IP/CIDRs, removed rule sets, and changed entries inside a rule set without changing its tag. Preserve sessions still served by an equivalent active route.
