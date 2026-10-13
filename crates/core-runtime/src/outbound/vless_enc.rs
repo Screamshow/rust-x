@@ -98,10 +98,8 @@ fn rand_between(from: i64, to: i64) -> i64 {
 
 fn derive_key_aead(ctx: &[u8], key: &[u8]) -> [u8; 32] {
     // The reference passes the ctx as a Go string — raw bytes preserved.
-    // blake3 derive_key hashes the context bytes verbatim, so bypass the
-    // UTF-8 check (Go's string(byte-slice) does the same).
-    let ctx_str = unsafe { std::str::from_utf8_unchecked(ctx) };
-    blake3::derive_key(ctx_str, key)
+    // Use the library's byte-context API; arbitrary wire bytes are not UTF-8.
+    blake3::derive_key_bytes(ctx, key)
 }
 
 fn blake3_sum256(data: &[u8]) -> [u8; 32] {
@@ -927,6 +925,23 @@ impl VlessEncryption {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn binary_derive_context_matches_reference_vector() {
+        let context = [0xff, 0, 0xc3, 0x28, 0x80, 0xf0, 0x9f, 0x92];
+        let result = super::derive_key_aead(&context, &[0x42; 32]);
+        let hex: String = result.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "4451382280b53cfedf471e21ab6d875d19d59c0af168c12930b2929a6258a917"
+        );
+        for context in ["", "VLESS", "unicode контекст"] {
+            assert_eq!(
+                super::derive_key_aead(context.as_bytes(), &[0x42; 32]),
+                blake3::derive_key(context, &[0x42; 32])
+            );
+        }
+    }
+
     use super::*;
 
     /// Minimal in-process responder mirroring Xray-core

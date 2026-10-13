@@ -906,11 +906,32 @@ impl DnsService {
                 if let Some(ip) = self.cached_server_addr(&key) {
                     return Ok(SocketAddr::new(ip, cfg.port));
                 }
-                let addrs = self.lookup_via(resolver, &cfg.server, depth + 1).await?;
-                let ip = pick_address(addrs, self.strategy)
-                    .ok_or_else(|| std::io::Error::other("dns: no addresses resolved"))?;
+                let result = self
+                    .lookup_via(resolver, &cfg.server, depth + 1)
+                    .await
+                    .and_then(|addrs| {
+                        pick_address(addrs, self.strategy)
+                            .ok_or_else(|| std::io::Error::other("dns: no addresses resolved"))
+                    });
+                let ip = match result {
+                    Ok(ip) => ip,
+                    Err(error) => {
+                        let stale = self
+                            .server_addrs
+                            .lock()
+                            .ok()
+                            .and_then(|cache| cache.get(&key).map(|(ip, _)| *ip));
+                        if let Some(ip) = stale {
+                            crate::logging::warn(format_args!(
+                                "dns: resolver {resolver_tag:?} refresh failed ({error}); using last address"
+                            ));
+                            return Ok(SocketAddr::new(ip, cfg.port));
+                        }
+                        return Err(error);
+                    }
+                };
                 if let Ok(mut cache) = self.server_addrs.lock() {
-                    cache.retain(|_, (_, at)| at.elapsed() < SERVER_ADDR_TTL);
+                    // One entry per configured resolver/host; keep expired addresses for refresh fallback.
                     cache.insert(key, (ip, Instant::now()));
                 }
                 return Ok(SocketAddr::new(ip, cfg.port));
@@ -1011,25 +1032,19 @@ impl DnsService {
                 None => system_lookup(host).await,
             });
         }
-        let mut out = Vec::new();
-        let mut last_error = None;
-        for qtype in self.strategy.query_types() {
-            let result = async {
-                let query = codec::build_query(rand_id(), host, *qtype)?;
-                let addr = self.resolve_server_addr(resolver, depth).await?;
-                let raw = transport::exchange(resolver, addr, &query, &self.dialer()).await?;
+        let addr = self.resolve_server_addr(resolver, depth).await?;
+        let mut tasks = tokio::task::JoinSet::new();
+        for &qtype in self.strategy.query_types() {
+            let service = Arc::clone(self);
+            let resolver = Arc::clone(resolver);
+            let host = host.to_string();
+            tasks.spawn(async move {
+                let query = codec::build_query(rand_id(), &host, qtype)?;
+                let raw = transport::exchange(&resolver, addr, &query, &service.dialer()).await?;
                 codec::answer_ips(&raw)
-            }
-            .await;
-            match result {
-                Ok(ips) => out.extend(ips),
-                Err(error) => last_error = Some(error),
-            }
+            });
         }
-        match (out.is_empty(), last_error) {
-            (true, Some(error)) => Err(error),
-            _ => Ok(out),
-        }
+        collect_families(tasks).await
     }
 
     /// `resolve` rule action with an explicit server tag: lookup bypasses the
@@ -1084,39 +1099,64 @@ impl DnsService {
             if let Some(ip) = transport::is_ip_literal(host) {
                 return Ok(vec![ip]);
             }
-            let qtypes = strategy.query_types();
-            let mut handles = Vec::with_capacity(qtypes.len());
-            for qtype in qtypes {
+            let mut tasks = tokio::task::JoinSet::new();
+            for &qtype in strategy.query_types() {
                 let host = host.to_string();
                 let service = Arc::clone(self);
-                handles.push(tokio::spawn(async move {
-                    let query = codec::build_query(rand_id(), &host, *qtype)?;
-                    let meta = QueryMeta::default();
+                tasks.spawn(async move {
+                    let query = codec::build_query(rand_id(), &host, qtype)?;
                     let raw = service
-                        .exchange(&meta, &query, false)
+                        .exchange(&QueryMeta::default(), &query, false)
                         .await
                         .map_err(std::io::Error::other)?;
                     codec::answer_ips(&raw)
-                }));
+                });
             }
-            let mut collected = Vec::new();
-            for handle in handles {
-                let ips = handle
-                    .await
-                    .map_err(|e| std::io::Error::other(format!("dns: resolve task: {e}")))?;
-                collected.extend(ips?);
-            }
-            if collected.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("dns: no addresses for {host:?}"),
-                ));
-            }
+            let collected = collect_families(tasks).await?;
             Ok(order_addresses(collected, strategy))
         };
         tokio::time::timeout(RESOLVE_TIMEOUT_GUARD, fut)
             .await
             .map_err(|_| std::io::Error::other(format!("dns: resolve timeout for {host:?}")))?
+    }
+}
+
+/// Keep a successful family when the other fails. Drop aborts unfinished tasks.
+async fn collect_families(
+    mut tasks: tokio::task::JoinSet<std::io::Result<Vec<IpAddr>>>,
+) -> std::io::Result<Vec<IpAddr>> {
+    let mut addresses = Vec::new();
+    let mut last_error = None;
+    let mut grace = None;
+    loop {
+        let result = if let Some(deadline) = grace {
+            match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+                Ok(result) => result,
+                Err(_) => break,
+            }
+        } else {
+            tasks.join_next().await
+        };
+        let Some(result) = result else {
+            break;
+        };
+        match result {
+            Ok(Ok(ips)) => {
+                addresses.extend(ips);
+                if !addresses.is_empty() && grace.is_none() {
+                    grace = Some(tokio::time::Instant::now() + Duration::from_millis(50));
+                }
+            }
+            Ok(Err(error)) => last_error = Some(error),
+            Err(error) => last_error = Some(std::io::Error::other(error)),
+        }
+    }
+    if addresses.is_empty() {
+        Err(last_error.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "dns: no addresses resolved")
+        }))
+    } else {
+        Ok(addresses)
     }
 }
 
@@ -1311,6 +1351,38 @@ pub(crate) async fn system_lookup(host: &str) -> Vec<std::net::IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_fast_family_survives_a_stalled_other_family_and_cancels_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct OnDrop(std::sync::Arc<AtomicBool>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let _guard = OnDrop(signal);
+            std::future::pending::<std::io::Result<Vec<std::net::IpAddr>>>().await
+        });
+        tasks.spawn(async { Ok(vec!["192.0.2.1".parse().unwrap()]) });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            super::collect_families(tasks),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            vec!["192.0.2.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        tokio::task::yield_now().await;
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
     use super::*;
 
     async fn bootstrap_fixture(
@@ -1400,6 +1472,29 @@ mod tests {
         service.resolve_server_addr(&other_port, 0).await.unwrap();
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
         worker.abort();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_refresh_failure_keeps_last_known_server_address() {
+        let (service, _, worker) = bootstrap_fixture(None, "ipv4_only").await;
+        let cfg = &service.servers["doh"];
+        let original = service.resolve_server_addr(cfg, 0).await.unwrap();
+        let key = ("boot".into(), "doh.invalid".into());
+        service
+            .server_addrs
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .1 = Instant::now() - SERVER_ADDR_TTL - Duration::from_secs(1);
+        worker.abort();
+        let _ = worker.await;
+        let recovered =
+            tokio::time::timeout(Duration::from_secs(7), service.resolve_server_addr(cfg, 0))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(recovered, original);
     }
 
     #[tokio::test]

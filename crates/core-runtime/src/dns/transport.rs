@@ -5,6 +5,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::inbound::AnyStream;
 use std::sync::{Mutex, RwLock};
@@ -71,6 +72,7 @@ pub struct ServerConfig {
     pub neighbor_domain: Vec<String>,
     /// `type: mdns`: the interfaces to query, empty for all of them
     pub mdns_interfaces: Vec<String>,
+    doh_h2: Mutex<Option<DohH2Conn>>,
 }
 
 /// The `hosts` server's sources: the files it reads and the inline entries,
@@ -309,41 +311,144 @@ impl FakeIpStore {
         if let Some(cache) = &cache {
             let mut cache = cache.lock().expect("cache");
             let mut state = self.state.lock().expect("fakeip state");
+            let mut changes = Vec::new();
+
             for (bucket, v6) in [("fakeip_domain4", false), ("fakeip_domain6", true)] {
                 for domain in cache.keys(bucket) {
-                    if let Some(ip) = cache
+                    let Some(ip) = cache
                         .get(bucket, domain.as_bytes())
                         .and_then(|raw| cached_ip(&raw))
-                        && self.contains(ip)
-                    {
-                        match ip {
-                            IpAddr::V4(ip) if !v6 => {
-                                state.cur4 = Some(state.cur4.map_or(ip, |cur| cur.max(ip)))
-                            }
-                            IpAddr::V6(ip) if v6 => {
-                                state.cur6 = Some(state.cur6.map_or(ip, |cur| cur.max(ip)))
-                            }
-                            _ => {}
+                        .filter(|ip| ip.is_ipv6() == v6 && self.contains(*ip))
+                    else {
+                        // Purge invalid/out-of-subnet forward record
+                        changes.push((bucket, domain.into_bytes(), None));
+                        continue;
+                    };
+
+                    let rev = cache
+                        .get("fakeip_address", &ip_bytes(ip))
+                        .and_then(|raw| String::from_utf8(raw).ok());
+                    if let Some(rev_domain) = rev {
+                        if rev_domain != domain {
+                            // Asymmetry on disk: IP claimed by another domain. Prune stale forward record.
+                            changes.push((bucket, domain.into_bytes(), None));
+                            continue;
                         }
+                    } else {
+                        // Reverse record is missing on disk: heal it guaranteed!
+                        changes.push((
+                            "fakeip_address",
+                            ip_bytes(ip),
+                            Some(domain.as_bytes().to_vec()),
+                        ));
+                    }
+
+                    let (evicted, superseded) = Self::remember(&mut state, ip, &domain);
+                    if let Some((ev_d, ev_ip)) = evicted {
+                        let ev_bucket = if ev_ip.is_ipv4() {
+                            "fakeip_domain4"
+                        } else {
+                            "fakeip_domain6"
+                        };
+                        changes.push((ev_bucket, ev_d.into_bytes(), None));
+                        changes.push(("fakeip_address", ip_bytes(ev_ip), None));
+                    }
+                    if let Some(prev) = superseded {
+                        changes.push((bucket, prev.into_bytes(), None));
+                    }
+                    match ip {
+                        IpAddr::V4(ip) if !v6 => {
+                            state.cur4 = Some(state.cur4.map_or(ip, |cur| cur.max(ip)))
+                        }
+                        IpAddr::V6(ip) if v6 => {
+                            state.cur6 = Some(state.cur6.map_or(ip, |cur| cur.max(ip)))
+                        }
+                        _ => {}
                     }
                 }
             }
+
+            // Inspect the repaired RAM map, not the old disk view: repairs and
+            // evictions above have not been applied to the cache yet.
+            for bytes in cache.raw_keys("fakeip_address") {
+                if bytes == b"fakeip_metadata" {
+                    continue;
+                }
+                let valid =
+                    cached_ip(&bytes).is_some_and(|ip| state.addr_to_domain.contains_key(&ip));
+                if !valid {
+                    changes.push(("fakeip_address", bytes, None));
+                }
+            }
+
             if let Some(raw) = cache.get("fakeip_address", b"fakeip_metadata")
                 && let Some((cur4, cur6)) = self.decode_metadata(&raw)
             {
                 state.cur4 = cur4;
                 state.cur6 = cur6;
             }
-            cache.put(
-                "fakeip_address",
-                b"fakeip_metadata",
-                self.encode_metadata(&state),
-            );
+            if !changes.is_empty() {
+                changes.push((
+                    "fakeip_address",
+                    b"fakeip_metadata".to_vec(),
+                    Some(self.encode_metadata(&state)),
+                ));
+                cache.apply_changes(changes);
+            }
         }
         *self.cache.write().expect("fakeip cache") = cache;
     }
 
-    fn persist(&self, state: &FakeIpState, ip: IpAddr, domain: &str) {
+    /// One paired insert into both maps: the LRU recency push, the reverse
+    /// record, and the cleanup on whichever side the insert evicts. What a
+    /// fresh allocation in `create` does, replayed for records found on disk.
+    /// Returns (evicted_pair, superseded_domain).
+    fn remember(
+        state: &mut FakeIpState,
+        ip: IpAddr,
+        domain: &str,
+    ) -> (Option<(String, IpAddr)>, Option<String>) {
+        let evicted = match ip {
+            IpAddr::V4(addr) => state
+                .domain_to_v4
+                .push(domain.to_string(), addr)
+                .map(|(d, a)| (d, IpAddr::V4(a))),
+            IpAddr::V6(addr) => state
+                .domain_to_v6
+                .push(domain.to_string(), addr)
+                .map(|(d, a)| (d, IpAddr::V6(a))),
+        };
+        if let Some((_, evicted_addr)) = &evicted {
+            state.addr_to_domain.remove(evicted_addr);
+        }
+        let superseded = if let Some(previous) = state.addr_to_domain.insert(ip, domain.to_string())
+            && previous != domain
+        {
+            // a pool wrap reissues an address an earlier domain still claims;
+            // drop that claim or forward and reverse disagree
+            match ip {
+                IpAddr::V4(_) => {
+                    state.domain_to_v4.pop(&previous);
+                }
+                IpAddr::V6(_) => {
+                    state.domain_to_v6.pop(&previous);
+                }
+            }
+            Some(previous)
+        } else {
+            None
+        };
+        (evicted, superseded)
+    }
+
+    fn persist(
+        &self,
+        state: &FakeIpState,
+        ip: IpAddr,
+        domain: &str,
+        evicted: Option<(String, IpAddr)>,
+        superseded: Option<String>,
+    ) {
         let cache = self.cache.read().expect("fakeip cache").clone();
         let Some(cache) = cache else { return };
         let mut cache = cache.lock().expect("cache");
@@ -353,16 +458,52 @@ impl FakeIpStore {
         } else {
             "fakeip_domain6"
         };
+        // Router flash protection: if the exact pair already lives on disk and nothing was evicted, skip!
+        let already_fwd = cache.get(bucket, domain.as_bytes()).as_deref() == Some(&address);
+        let already_rev =
+            cache.get("fakeip_address", &address).as_deref() == Some(domain.as_bytes());
+        if already_fwd && already_rev && evicted.is_none() && superseded.is_none() {
+            return;
+        }
+
         let mut changes = Vec::new();
-        if let Some(previous) = cache.get("fakeip_address", &address) {
+        // 1. Evicted pair must be atomically deleted from both maps on disk:
+        if let Some((ev_domain, ev_ip)) = evicted {
+            let ev_bucket = if ev_ip.is_ipv4() {
+                "fakeip_domain4"
+            } else {
+                "fakeip_domain6"
+            };
+            changes.push((ev_bucket, ev_domain.into_bytes(), None));
+            changes.push(("fakeip_address", ip_bytes(ev_ip), None));
+        }
+        // 2. Superseded domain previously had this IP address:
+        if let Some(prev) = superseded {
+            changes.push((bucket, prev.into_bytes(), None));
+        }
+        // 3. Any previous domain associated with this IP on disk:
+        if let Some(previous) = cache.get("fakeip_address", &address)
+            && previous != domain.as_bytes()
+        {
             changes.push((bucket, previous, None));
         }
-        changes.push((
-            "fakeip_address",
-            address.clone(),
-            Some(domain.as_bytes().to_vec()),
-        ));
-        changes.push((bucket, domain.as_bytes().to_vec(), Some(address)));
+        // 4. Any previous IP associated with this domain on disk:
+        if let Some(old_ip_bytes) = cache.get(bucket, domain.as_bytes())
+            && old_ip_bytes != address
+        {
+            changes.push(("fakeip_address", old_ip_bytes, None));
+        }
+        // 5. Store both forward and reverse atomically:
+        if !already_rev {
+            changes.push((
+                "fakeip_address",
+                address.clone(),
+                Some(domain.as_bytes().to_vec()),
+            ));
+        }
+        if !already_fwd {
+            changes.push((bucket, domain.as_bytes().to_vec(), Some(address)));
+        }
         changes.push((
             "fakeip_address",
             b"fakeip_metadata".to_vec(),
@@ -467,19 +608,28 @@ impl FakeIpStore {
             .addr_to_domain
             .get(&ip)
             .cloned();
-        memory.or_else(|| {
-            if !self.contains(ip) {
-                return None;
-            }
-            let cache = self.cache.read().expect("fakeip cache").clone()?;
-            let value = cache
-                .lock()
-                .expect("cache")
-                .get("fakeip_address", &ip_bytes(ip))?;
-            String::from_utf8(value)
-                .ok()
-                .filter(|domain| !domain.is_empty())
-        })
+        if memory.is_some() {
+            return memory;
+        }
+        if !self.contains(ip) {
+            return None;
+        }
+        let cache = self.cache.read().expect("fakeip cache").clone()?;
+        let value = cache
+            .lock()
+            .expect("cache")
+            .get("fakeip_address", &ip_bytes(ip))?;
+        let domain = String::from_utf8(value)
+            .ok()
+            .filter(|domain| !domain.is_empty())?;
+        // A record that only lives on disk is one flush failure away from a
+        // TPROXY connection reset; mirror it into memory and heal persistence while we are here.
+        let mut state = self.state.lock().expect("fakeip state");
+        let (evicted, superseded) = Self::remember(&mut state, ip, &domain);
+        if evicted.is_some() || superseded.is_some() {
+            self.persist(&state, ip, &domain, evicted, superseded);
+        }
+        Some(domain)
     }
 
     pub fn lookup_address(&self, domain: &str, v6: bool) -> Option<IpAddr> {
@@ -507,12 +657,24 @@ impl FakeIpStore {
 
     pub fn create(&self, domain: &str, v6: bool) -> io::Result<IpAddr> {
         if let Some(ip) = self.lookup_address(domain, v6) {
+            let mut state = self.state.lock().expect("fakeip state");
+            let in_memory_ok = state
+                .addr_to_domain
+                .get(&ip)
+                .is_some_and(|known| known == domain);
+            if !in_memory_ok {
+                let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+                self.persist(&state, ip, domain, evicted, superseded);
+            }
             return Ok(ip);
         }
         let mut state = self.state.lock().expect("fakeip state");
         if v6 {
-            if let Some(existing) = state.domain_to_v6.get(domain) {
-                return Ok(IpAddr::V6(*existing));
+            if let Some(existing) = state.domain_to_v6.get(domain).copied() {
+                let ip = IpAddr::V6(existing);
+                let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+                self.persist(&state, ip, domain, evicted, superseded);
+                return Ok(ip);
             }
             let prefix = self
                 .v6
@@ -522,22 +684,16 @@ impl FakeIpStore {
                 .ok_or_else(|| io::Error::other("fakeip: no inet6 range"))?;
             let next = next_v6(cur, prefix);
             state.cur6 = Some(next);
-            if let Some((_evicted, addr)) = state.domain_to_v6.push(domain.to_string(), next) {
-                state.addr_to_domain.remove(&IpAddr::V6(addr));
-            }
-            if let Some(previous) = state
-                .addr_to_domain
-                .insert(IpAddr::V6(next), domain.to_string())
-            {
-                // a pool wrap reissues an address an earlier domain still
-                // claims; drop that claim or forward and reverse disagree
-                let _ = state.domain_to_v6.pop(&previous);
-            }
-            self.persist(&state, IpAddr::V6(next), domain);
-            Ok(IpAddr::V6(next))
+            let ip = IpAddr::V6(next);
+            let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+            self.persist(&state, ip, domain, evicted, superseded);
+            Ok(ip)
         } else {
-            if let Some(existing) = state.domain_to_v4.get(domain) {
-                return Ok(IpAddr::V4(*existing));
+            if let Some(existing) = state.domain_to_v4.get(domain).copied() {
+                let ip = IpAddr::V4(existing);
+                let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+                self.persist(&state, ip, domain, evicted, superseded);
+                return Ok(ip);
             }
             let prefix = self
                 .v4
@@ -547,19 +703,10 @@ impl FakeIpStore {
                 .ok_or_else(|| io::Error::other("fakeip: no inet4 range"))?;
             let next = next_v4(cur, prefix);
             state.cur4 = Some(next);
-            if let Some((_evicted, addr)) = state.domain_to_v4.push(domain.to_string(), next) {
-                state.addr_to_domain.remove(&IpAddr::V4(addr));
-            }
-            if let Some(previous) = state
-                .addr_to_domain
-                .insert(IpAddr::V4(next), domain.to_string())
-            {
-                // a pool wrap reissues an address an earlier domain still
-                // claims; drop that claim or forward and reverse disagree
-                let _ = state.domain_to_v4.pop(&previous);
-            }
-            self.persist(&state, IpAddr::V4(next), domain);
-            Ok(IpAddr::V4(next))
+            let ip = IpAddr::V4(next);
+            let (evicted, superseded) = Self::remember(&mut state, ip, domain);
+            self.persist(&state, ip, domain, evicted, superseded);
+            Ok(ip)
         }
     }
 }
@@ -876,6 +1023,7 @@ impl ServerConfig {
             group,
             neighbor_domain,
             mdns_interfaces,
+            doh_h2: Mutex::new(None),
         })
     }
 
@@ -1032,6 +1180,8 @@ async fn exchange_udp(
 
     let mut buf = vec![0u8; 65535];
     let retransmit_interval = Duration::from_millis(1500);
+    const MAX_UDP_RETRIES: usize = 2; // 1 initial + 2 retries = 3 attempts total (~4.5s)
+    let mut retries = 0;
     loop {
         let recv_fut = async {
             match socket.recv(&mut buf).await {
@@ -1050,6 +1200,13 @@ async fn exchange_udp(
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
+                retries += 1;
+                if retries > MAX_UDP_RETRIES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "dns: udp exchange timed out after maximum retries",
+                    ));
+                }
                 let _ = send_query().await;
             }
         }
@@ -1084,6 +1241,24 @@ async fn exchange_doh(
     // the reference posts these with `Id = 0`, as RFC 8484/9250 allow
     let wire = wire_query(query);
     let query = wire.as_slice();
+
+    // Reuse the pooled h2 connection the way the reference hands requests to
+    // its shared http2.Transport (dns/transport/https_transport.go): a full
+    // TLS + h2 handshake per query burned the router's CPU and filled
+    // TIME_WAIT against one DoH server until nothing resolved at all.
+    if let Some((id, send)) = doh_h2_checkout(cfg, addr) {
+        match doh_h2_exchange(cfg, send, query).await {
+            Ok(body) => return Ok(body),
+            Err(e) => {
+                doh_h2_discard(cfg, id);
+                crate::logging::debug(format_args!(
+                    "dns: DoH h2 connection for {:?} dropped after error: {e}",
+                    cfg.tag
+                ));
+            }
+        }
+    }
+
     let tls = cfg
         .tls
         .as_ref()
@@ -1094,11 +1269,106 @@ async fn exchange_doh(
         .map_err(|e| io::Error::other(format!("dns: DoH tls: {e}")))?;
 
     match negotiated.as_deref() {
-        Some(b"h2") => exchange_doh_h2(cfg, tls, query).await,
+        Some(b"h2") => {
+            let (send, conn) = h2::client::handshake(tls)
+                .await
+                .map_err(|e| io::Error::other(format!("dns: DoH h2 handshake: {e}")))?;
+            let task = tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let conn = DohH2Conn {
+                id: DOH_H2_NEXT.fetch_add(1, Ordering::Relaxed),
+                addr,
+                send: send.clone(),
+                task,
+            };
+            let send = send
+                .ready()
+                .await
+                .map_err(|e| io::Error::other(format!("dns: DoH h2 ready: {e}")))?;
+            // A concurrent first query may have won. The loser owns its driver
+            // until its own request completes, then Drop aborts it.
+            let mut unused = Some(conn);
+            {
+                let mut pool = cfg.doh_h2.lock().unwrap_or_else(|e| e.into_inner());
+                if pool.as_ref().is_none_or(|conn| conn.addr != addr) {
+                    *pool = unused.take();
+                }
+            }
+            doh_h2_exchange(cfg, send, query).await
+        }
         _ => exchange_doh_h1(cfg, tls, query).await,
     }
 }
 
+/// One pooled DoH h2 connection: a send handle for new streams plus the
+/// driver task that must outlive every stream on it.
+struct DohH2Conn {
+    id: u64,
+    addr: SocketAddr,
+    send: h2::client::SendRequest<bytes::Bytes>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DohH2Conn {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+static DOH_H2_NEXT: AtomicU64 = AtomicU64::new(1);
+
+fn doh_h2_checkout(
+    cfg: &ServerConfig,
+    addr: SocketAddr,
+) -> Option<(u64, h2::client::SendRequest<bytes::Bytes>)> {
+    let pool = cfg.doh_h2.lock().ok()?;
+    pool.as_ref()
+        .filter(|conn| conn.addr == addr)
+        .map(|conn| (conn.id, conn.send.clone()))
+}
+
+fn doh_h2_discard(cfg: &ServerConfig, id: u64) {
+    let mut pool = cfg.doh_h2.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.as_ref().is_some_and(|conn| conn.id == id) {
+        *pool = None;
+    }
+}
+
+/// One DoH request/response stream over an h2 connection, pooled or fresh.
+async fn doh_h2_exchange(
+    cfg: &ServerConfig,
+    send_request: h2::client::SendRequest<bytes::Bytes>,
+    query: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut send_request = send_request
+        .ready()
+        .await
+        .map_err(|e| io::Error::other(format!("dns: DoH h2 ready: {e}")))?;
+    let authority = doh_authority(cfg);
+    let request = doh_request(cfg, &authority, query.len())?;
+    let (response, send) = send_request
+        .send_request(request, false)
+        .map_err(|e| io::Error::other(format!("dns: DoH send: {e}")))?;
+
+    let mut io = H2Io {
+        // `shared`: the connection outlives the stream — the pool owns it
+        h2: H2Stream::shared(response, send),
+    };
+    io.write_all(query).await?;
+    io.shutdown().await?;
+    let mut body = Vec::new();
+    io.read_to_end(&mut body).await?;
+    if body.is_empty() {
+        return Err(io::Error::other("dns: empty DoH response"));
+    }
+    Ok(body)
+}
+
+/// The per-query h2 path: the stream owns the connection and takes the
+/// driver down with it on drop. Kept for tests; production goes through the
+/// pooled [`doh_h2_exchange`].
+#[cfg(test)]
 async fn exchange_doh_h2(
     cfg: &ServerConfig,
     stream: AnyStream,

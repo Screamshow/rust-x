@@ -600,6 +600,12 @@ impl TunDevice {
     }
 }
 
+/// Cap on the queues between TUN and the userspace stack. A flood the stack
+/// cannot drain must drop (the kernel retransmits TCP) rather than grow until
+/// the OOM killer picks the daemon on a 128 MiB router.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the linux TUN path drains these queues
+const TUN_QUEUE_CAP: usize = 512;
+
 impl Device for TunDevice {
     type RxToken<'a>
         = TunRxToken
@@ -670,7 +676,9 @@ impl PhyTxToken for TunTxToken<'_> {
     {
         let mut buffer = vec![0u8; len];
         let result = f(&mut buffer);
-        self.queue.push_back(buffer);
+        if self.queue.len() < TUN_QUEUE_CAP {
+            self.queue.push_back(buffer);
+        }
         result
     }
 }
@@ -683,10 +691,55 @@ struct TunTcpSession {
     dest: SocketAddr,
     to_app: mpsc::Sender<Bytes>,
     from_app: mpsc::Receiver<Bytes>,
+    /// Leftover of a chunk `send_slice` could not fully take; kept until the
+    /// socket drains — dropping the tail would silently corrupt the TCP stream.
+    pending_app: Option<Bytes>,
     created: Instant,
     app_closed: bool,
     established: bool,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+enum TunPump {
+    Progress,
+    Blocked,
+    Closed,
+}
+
+/// One FIFO chunk. A partial write or error leaves the remainder for the next poll.
+fn pump_tun_chunk(
+    pending: &mut Option<Bytes>,
+    from_app: &mut mpsc::Receiver<Bytes>,
+    mut send: impl FnMut(&[u8]) -> Result<usize, smoltcp::socket::tcp::SendError>,
+) -> TunPump {
+    let chunk = match pending.take() {
+        Some(chunk) => chunk,
+        None => match from_app.try_recv() {
+            Ok(chunk) => chunk,
+            Err(mpsc::error::TryRecvError::Empty) => return TunPump::Blocked,
+            Err(mpsc::error::TryRecvError::Disconnected) => return TunPump::Closed,
+        },
+    };
+    match send(&chunk) {
+        Ok(n) if n == chunk.len() => TunPump::Progress,
+        Ok(n) => {
+            *pending = Some(chunk.slice(n..));
+            TunPump::Blocked
+        }
+        Err(_) => {
+            *pending = Some(chunk);
+            TunPump::Blocked
+        }
+    }
+}
+
+type TunReservation = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mpsc::OwnedPermit<Bytes>, mpsc::error::SendError<()>>,
+            > + Send,
+    >,
+>;
 
 /// AsyncRead + AsyncWrite stream adapter bridging mpsc channels to `ClientConn`.
 #[allow(dead_code)]
@@ -695,6 +748,7 @@ struct TunStream {
     tx: mpsc::Sender<Bytes>,
     notify: Arc<Notify>,
     current: Option<(Bytes, usize)>,
+    reservation: Option<TunReservation>,
 }
 
 impl AsyncRead for TunStream {
@@ -733,22 +787,29 @@ impl AsyncRead for TunStream {
 
 impl AsyncWrite for TunStream {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        match self.tx.try_send(Bytes::copy_from_slice(buf)) {
-            Ok(()) => {
+        if buf.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
+        if self.reservation.is_none() {
+            self.reservation = Some(Box::pin(self.tx.clone().reserve_owned()));
+        }
+        let reservation = self.reservation.as_mut().expect("reservation");
+        match reservation.as_mut().poll(cx) {
+            std::task::Poll::Ready(Ok(permit)) => {
+                self.reservation = None;
+                permit.send(Bytes::copy_from_slice(buf));
                 self.notify.notify_one();
                 std::task::Poll::Ready(Ok(buf.len()))
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
+            std::task::Poll::Ready(Err(_)) => {
+                self.reservation = None;
+                std::task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
-            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 
@@ -797,13 +858,13 @@ async fn drive_tun_stack(
 
             // Drain data from smoltcp socket to application stream
             while sock.can_recv() {
+                let Ok(permit) = session.to_app.try_reserve() else {
+                    break;
+                };
                 match sock.recv_slice(scratch) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let chunk = Bytes::copy_from_slice(&scratch[..n]);
-                        if session.to_app.try_send(chunk).is_err() {
-                            break;
-                        }
+                        permit.send(Bytes::copy_from_slice(&scratch[..n]));
                     }
                     Err(_) => break,
                 }
@@ -811,14 +872,12 @@ async fn drive_tun_stack(
 
             // Drain data from application stream to smoltcp socket
             while sock.can_send() {
-                match session.from_app.try_recv() {
-                    Ok(data) => {
-                        if sock.send_slice(&data).is_err() {
-                            break;
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                match pump_tun_chunk(&mut session.pending_app, &mut session.from_app, |chunk| {
+                    sock.send_slice(chunk)
+                }) {
+                    TunPump::Progress => {}
+                    TunPump::Blocked => break,
+                    TunPump::Closed => {
                         session.app_closed = true;
                         sock.close();
                         break;
@@ -955,6 +1014,7 @@ fn handle_ipv4_packet(
                         tx: from_app_tx,
                         notify: Arc::clone(notify),
                         current: None,
+                        reservation: None,
                     };
 
                     let client = ClientConn::framed(Box::new(tun_stream), source);
@@ -973,6 +1033,7 @@ fn handle_ipv4_packet(
                             dest,
                             to_app: to_app_tx,
                             from_app: from_app_rx,
+                            pending_app: None,
                             created: Instant::now(),
                             app_closed: false,
                             established: false,
@@ -981,7 +1042,9 @@ fn handle_ipv4_packet(
                 }
             }
 
-            device.rx_queue.push_back(packet.to_vec());
+            if device.rx_queue.len() < TUN_QUEUE_CAP {
+                device.rx_queue.push_back(packet.to_vec());
+            }
         }
         _ => {}
     }
@@ -1089,6 +1152,7 @@ fn handle_ipv6_packet(
                         tx: from_app_tx,
                         notify: Arc::clone(notify),
                         current: None,
+                        reservation: None,
                     };
 
                     let client = ClientConn::framed(Box::new(tun_stream), source);
@@ -1107,6 +1171,7 @@ fn handle_ipv6_packet(
                             dest,
                             to_app: to_app_tx,
                             from_app: from_app_rx,
+                            pending_app: None,
                             created: Instant::now(),
                             app_closed: false,
                             established: false,
@@ -1115,7 +1180,9 @@ fn handle_ipv6_packet(
                 }
             }
 
-            device.rx_queue.push_back(packet.to_vec());
+            if device.rx_queue.len() < TUN_QUEUE_CAP {
+                device.rx_queue.push_back(packet.to_vec());
+            }
         }
         _ => {}
     }
@@ -1696,6 +1763,69 @@ mod linux {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn partial_tcp_writes_and_errors_preserve_byte_order_until_eof() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        sender.send(Bytes::from_static(b"abcdef")).await.unwrap();
+        sender.send(Bytes::from_static(b"ghijk")).await.unwrap();
+        drop(sender);
+        let mut pending = None;
+        assert_eq!(
+            pump_tun_chunk(&mut pending, &mut receiver, |_| Err(
+                smoltcp::socket::tcp::SendError::InvalidState
+            )),
+            TunPump::Blocked
+        );
+        let mut received = Vec::new();
+        loop {
+            let state = pump_tun_chunk(&mut pending, &mut receiver, |chunk| {
+                let n = chunk.len().min(2);
+                received.extend_from_slice(&chunk[..n]);
+                Ok(n)
+            });
+            if state == TunPump::Closed {
+                break;
+            }
+        }
+        assert_eq!(received, b"abcdefghijk");
+        assert!(pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn full_tun_channel_waits_then_writes_without_spinning() {
+        use tokio::io::AsyncWriteExt;
+        let (tx, mut receiver) = mpsc::channel(1);
+        let (_, rx) = mpsc::channel(1);
+        tx.send(Bytes::from_static(b"first")).await.unwrap();
+        let mut stream = TunStream {
+            rx,
+            tx,
+            notify: Arc::new(Notify::new()),
+            current: None,
+            reservation: None,
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stream.write_all(b"second"))
+                .await
+                .is_err()
+        );
+        assert!(stream.reservation.is_some());
+        assert_eq!(receiver.recv().await.unwrap(), Bytes::from_static(b"first"));
+        tokio::time::timeout(Duration::from_secs(1), stream.write_all(b"second"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            Bytes::from_static(b"second")
+        );
+        drop(receiver);
+        assert_eq!(
+            stream.write_all(b"closed").await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
     use super::*;
 
     #[test]

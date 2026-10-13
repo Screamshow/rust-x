@@ -195,6 +195,11 @@ impl CacheFile {
     }
 
     pub fn put(&mut self, bucket: &str, key: &[u8], value: Vec<u8>) {
+        if let Some(existing) = self.buckets.get(bucket).and_then(|b| b.get(key))
+            && existing == &value
+        {
+            return;
+        }
         self.pending += key.len() + value.len();
         self.buckets
             .entry(bucket.to_string())
@@ -216,20 +221,30 @@ impl CacheFile {
 
     /// Update paired records before a due flush can expose half an update.
     pub(crate) fn apply_changes(&mut self, changes: Vec<CacheChange<'_>>) {
+        let mut modified = false;
         for (bucket, key, value) in changes {
             let entries = self.buckets.entry(bucket.to_string()).or_default();
-            self.pending += key.len() + value.as_ref().map_or(0, Vec::len);
             match value {
                 Some(value) => {
+                    if entries.get(&key) == Some(&value) {
+                        continue;
+                    }
+                    self.pending += key.len() + value.len();
                     entries.insert(key, value);
+                    modified = true;
                 }
                 None => {
-                    entries.remove(&key);
+                    if entries.remove(&key).is_some() {
+                        self.pending += key.len();
+                        modified = true;
+                    }
                 }
             }
         }
-        self.dirty = true;
-        self.flush_if_due();
+        if modified {
+            self.dirty = true;
+            self.flush_if_due();
+        }
     }
 
     /// Write out if the pending bytes or the elapsed time says so.
@@ -271,6 +286,14 @@ impl CacheFile {
                     .filter_map(|key| String::from_utf8(key.clone()).ok())
                     .collect()
             })
+            .unwrap_or_default()
+    }
+
+    /// Every binary key of a bucket, in order.
+    pub fn raw_keys(&self, bucket: &str) -> Vec<Vec<u8>> {
+        self.buckets
+            .get(bucket)
+            .map(|entries| entries.keys().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -454,4 +477,36 @@ fn build_tree(buckets: &CacheBuckets) -> NodeSpec {
         });
     }
     NodeSpec { entries }
+}
+
+#[cfg(test)]
+mod no_op_tests {
+    use super::*;
+    #[test]
+    fn identical_updates_do_not_dirty_or_replace_the_database() {
+        let path = std::env::temp_dir().join(format!("rust-x-noop-{}.db", std::process::id()));
+        let options = CacheFileOptions {
+            enabled: true,
+            path: path.to_string_lossy().into_owned(),
+            flush_interval: Duration::ZERO,
+            ..Default::default()
+        };
+        let mut cache = CacheFile::open(options).unwrap().unwrap();
+        cache.put("test", b"key", vec![1, 2, 3]);
+        assert!(!cache.dirty);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        cache.put("test", b"key", vec![1, 2, 3]);
+        cache.apply_changes(vec![
+            ("test", b"key".to_vec(), Some(vec![1, 2, 3])),
+            ("test", b"absent".to_vec(), None),
+        ]);
+        assert!(!cache.dirty);
+        assert_eq!(cache.pending, 0);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+        drop(cache);
+        std::fs::remove_file(path).unwrap();
+    }
 }

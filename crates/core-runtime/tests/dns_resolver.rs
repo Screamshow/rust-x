@@ -264,10 +264,17 @@ async fn spawn_dot_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
 
 /// DNS-over-HTTPS with h2: one request/response per stream.
 async fn spawn_doh_h2_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
+    let (addr, hits, _) = spawn_doh_h2_dns_counted(answer_ip).await;
+    (addr, hits)
+}
+
+async fn spawn_doh_h2_dns_counted(answer_ip: Ipv4Addr) -> (SocketAddr, Hits, Hits) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind doh");
     let addr = listener.local_addr().expect("doh addr");
     let hits = Arc::new(AtomicUsize::new(0));
     let hits2 = Arc::clone(&hits);
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted_count = connections.clone();
     tokio::spawn(async move {
         let tls_cfg = server_tls_config(&["h2"]);
         let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
@@ -275,6 +282,7 @@ async fn spawn_doh_h2_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
+            accepted_count.fetch_add(1, Ordering::SeqCst);
             let hits = Arc::clone(&hits2);
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
@@ -320,7 +328,7 @@ async fn spawn_doh_h2_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
             });
         }
     });
-    (addr, hits)
+    (addr, hits, connections)
 }
 
 async fn spawn_echo() -> SocketAddr {
@@ -920,4 +928,28 @@ async fn tcp_transport_uses_the_detour_outbound() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("detour"), "{error}");
+}
+
+#[tokio::test]
+async fn doh_reuses_connection_and_separates_same_tag_configurations() {
+    let (addr, hits, connections) = spawn_doh_h2_dns_counted(Ipv4Addr::new(10, 0, 0, 3)).await;
+    let config = |addr: SocketAddr| json!({"dns": {"servers": [{"type":"https","tag":"same","server":"127.0.0.1","server_port":addr.port(),"tls":{"enabled":true,"server_name":"localhost","insecure":true}}],"final":"same","disable_cache":true}});
+    let svc = service(&config(addr));
+    for n in 0..3 {
+        let raw = exchange_ok(&svc, &query(&format!("reuse-{n}.test"), "A")).await;
+        assert_eq!(
+            core_runtime::dns::codec::answer_ips(&raw).unwrap(),
+            vec![ip(10, 0, 0, 3)]
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+    let (other, _, other_connections) = spawn_doh_h2_dns_counted(Ipv4Addr::new(10, 0, 0, 4)).await;
+    let replacement = service(&config(other));
+    let raw = exchange_ok(&replacement, &query("changed.test", "A")).await;
+    assert_eq!(
+        core_runtime::dns::codec::answer_ips(&raw).unwrap(),
+        vec![ip(10, 0, 0, 4)]
+    );
+    assert_eq!(other_connections.load(Ordering::SeqCst), 1);
 }

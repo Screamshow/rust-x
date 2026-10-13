@@ -421,14 +421,27 @@ fn prefix_contains(prefix: &str, address: std::net::IpAddr) -> bool {
     }
 }
 
-fn port_range_contains(range: &str, port: u16) -> bool {
-    let Some((from, to)) = range.split_once('-') else {
-        return false;
-    };
-    match (from.trim().parse::<u16>(), to.trim().parse::<u16>()) {
-        (Ok(from), Ok(to)) => port >= from && port <= to,
-        _ => false,
+/// Source JSON uses colon ranges; retain historical hyphen input as well.
+pub(crate) fn parse_port_range(range: &str) -> Option<(u16, u16)> {
+    let (from, to) = range.split_once(':').or_else(|| range.split_once('-'))?;
+    if !range.contains(':') && (from.trim().is_empty() || to.trim().is_empty()) {
+        return None;
     }
+    let from = if from.trim().is_empty() {
+        0
+    } else {
+        from.trim().parse().ok()?
+    };
+    let to = if to.trim().is_empty() {
+        u16::MAX
+    } else {
+        to.trim().parse().ok()?
+    };
+    (from <= to).then_some((from, to))
+}
+
+fn port_range_contains(range: &str, port: u16) -> bool {
+    parse_port_range(range).is_some_and(|(from, to)| port >= from && port <= to)
 }
 
 #[cfg(test)]

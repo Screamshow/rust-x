@@ -771,13 +771,7 @@ fn insert_prefix(v4: &mut PrefixSet<u32>, v6: &mut PrefixSet<u128>, prefix: &str
 fn parse_ranges(entries: Vec<String>) -> Vec<(u16, u16)> {
     entries
         .iter()
-        .filter_map(|entry| {
-            let (from, to) = entry.split_once('-')?;
-            match (from.trim().parse::<u16>(), to.trim().parse::<u16>()) {
-                (Ok(from), Ok(to)) => Some((from, to)),
-                _ => None,
-            }
-        })
+        .filter_map(|entry| super::rule_set::parse_port_range(entry))
         .collect()
 }
 

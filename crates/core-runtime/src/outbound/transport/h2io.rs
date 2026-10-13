@@ -15,9 +15,10 @@ use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
-/// Receive window per stream and per connection. Sized to 2 MiB stream / 8 MiB
-/// connection to sustain 10+ Gbps transfers without ballooning client RSS
-/// across concurrent pooled connections.
+/// Receive window per stream and per connection: 8 MiB a stream, 32 MiB a
+/// connection, sized to sustain 10+ Gbps transfers without ballooning
+/// client RSS across concurrent pooled connections. The window is also the
+/// memory ceiling for whatever a fast peer has in flight to a slow reader.
 const STREAM_WINDOW: u32 = 8 << 20;
 const CONN_WINDOW: u32 = 32 << 20;
 /// Largest DATA frame we ask the peer to send.
@@ -154,11 +155,26 @@ impl H2Stream {
                 self.pending.pop_front();
             }
         }
-        want - left
+        let went = want - left;
+        self.release(went);
+        went
+    }
+
+    /// Repay `n` bytes that left `pending`. The window is only repaid when
+    /// bytes actually leave our buffer: advertising buffered-but-unread data
+    /// tells the peer it may keep sending into a reader that stopped, and
+    /// the connection half of the window is shared with the pooled session.
+    pub(crate) fn release(&mut self, n: usize) {
+        if n > 0
+            && let Some(recv) = self.recv.as_mut()
+        {
+            let _ = recv.flow_control().release_capacity(n);
+        }
     }
 
     /// Drop `n` pending bytes without copying them.
     pub(crate) fn skip_pending(&mut self, mut n: usize) {
+        let start = n;
         while n > 0 {
             let Some(front) = self.pending.front_mut() else {
                 break;
@@ -171,6 +187,7 @@ impl H2Stream {
                 self.pending.pop_front();
             }
         }
+        self.release(start - n);
     }
 
     /// Queue `frame` bytes for transmission; `report` is returned to the
@@ -259,8 +276,9 @@ impl H2Stream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(chunk))) => {
                 let len = chunk.len();
-                let _ = recv.flow_control().release_capacity(len);
-                // pushed as it arrived: no join, no copy of either side
+                // pushed as it arrived: no join, no copy of either side.
+                // Capacity is repaid when the bytes leave `pending`, not
+                // while we are still holding them.
                 self.pending.push_back(chunk);
                 self.pending_len += len;
                 Poll::Ready(Ok(true))
@@ -326,8 +344,13 @@ impl H2Stream {
             match recv.poll_data(cx) {
                 Poll::Ready(Some(Ok(mut chunk))) => {
                     let len = chunk.len();
-                    let _ = recv.flow_control().release_capacity(len);
                     let want = out.remaining();
+                    // Only what reaches the caller right now is repaid; the
+                    // tail waits in `pending` and is repaid by `serve`.
+                    let served = want.min(len);
+                    if served > 0 {
+                        let _ = recv.flow_control().release_capacity(served);
+                    }
                     if want >= len {
                         out.put_slice(&chunk);
                     } else if want > 0 {
@@ -373,6 +396,11 @@ impl H2Stream {
 
 impl Drop for H2Stream {
     fn drop(&mut self) {
+        // Whatever is still in `pending` was counted against the shared
+        // connection window: repay it, or a stream dropped with an unread
+        // body shrinks the window the pooled session runs on for good.
+        let unread = self.pending_len;
+        self.release(unread);
         if let Some(mut send) = self.send.take() {
             send.send_reset(h2::Reason::CANCEL);
         }
@@ -426,5 +454,96 @@ impl AsyncWrite for H2Io {
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
         self.h2.poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod backpressure_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn unread_body_stops_sender_and_drain_reopens_the_window() {
+        const WINDOW: usize = 32 * 1024;
+        const BODY: usize = WINDOW * 8;
+        let (client, server) = tokio::io::duplex(128 * 1024);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let count = sent.clone();
+        let server_task = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server).await.unwrap();
+            let (_, mut respond) = conn.accept().await.unwrap().unwrap();
+            let mut stream = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let sender = tokio::spawn(async move {
+                let mut remaining = BODY;
+                while remaining > 0 {
+                    stream.reserve_capacity(remaining);
+                    let capacity = if stream.capacity() > 0 {
+                        stream.capacity()
+                    } else {
+                        std::future::poll_fn(|cx| stream.poll_capacity(cx))
+                            .await
+                            .unwrap()
+                            .unwrap()
+                    };
+                    if capacity == 0 {
+                        continue;
+                    }
+                    let len = capacity.min(remaining).min(16 * 1024);
+                    remaining -= len;
+                    stream
+                        .send_data(Bytes::from(vec![0x5a; len]), remaining == 0)
+                        .unwrap();
+                    count.fetch_add(len, Ordering::SeqCst);
+                }
+            });
+            while conn.accept().await.is_some() {}
+            sender.await.unwrap();
+        });
+        let (mut send, connection) = h2::client::Builder::new()
+            .initial_window_size(WINDOW as u32)
+            .initial_connection_window_size((WINDOW * 2) as u32)
+            .handshake(client)
+            .await
+            .unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let (response, stream) = send.send_request(http::Request::new(()), true).unwrap();
+        let mut io = H2Io {
+            h2: H2Stream::new(response, stream, driver),
+        };
+        let mut first = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(3), io.read_exact(&mut first))
+            .await
+            .expect("first byte deadline")
+            .unwrap();
+        assert_eq!(first, [0x5a]);
+        // Poll without consuming, as gRPC's header parser does while buffering.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            std::future::poll_fn(|cx| io.h2.poll_recv_more(cx)),
+        )
+        .await
+        .expect("buffer second frame deadline")
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(sent.load(Ordering::SeqCst) <= WINDOW + 1);
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), io.read_to_end(&mut rest))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rest.len() + 1, BODY);
+        assert!(rest.iter().all(|byte| *byte == 0x5a));
+        drop(io);
+        drop(send);
+        server_task.abort();
     }
 }

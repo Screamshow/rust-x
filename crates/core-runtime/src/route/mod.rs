@@ -429,7 +429,7 @@ pub(crate) fn build_rule_sets(
                     if let Some(parent) = target_path.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    std::fs::write(&target_path, &tsrs_bytes)?;
+                    rule_set_remote::write_tsrs_if_changed(&target_path, &tsrs_bytes)?;
                     let mmap_set = std::sync::Arc::new(mmap_set::MmapRuleSet::open_with_mode(
                         &target_path,
                         mode,
@@ -478,7 +478,7 @@ pub(crate) fn build_rule_sets(
                         if let Some(parent) = target_path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        std::fs::write(&target_path, &tsrs_bytes)?;
+                        rule_set_remote::write_tsrs_if_changed(&target_path, &tsrs_bytes)?;
                         let mmap_set = std::sync::Arc::new(mmap_set::MmapRuleSet::open_with_mode(
                             &target_path,
                             mode,
@@ -1142,6 +1142,7 @@ impl RouterInner {
                 _ => {}
             }
         }
+        ctx.matched_rule = Some(("final".into(), self.default_tag().into()));
         Ok(Decision::Outbound(self.default))
     }
 

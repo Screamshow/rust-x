@@ -213,13 +213,9 @@ impl RuleSetCompiler {
                     self.add_port(p);
                 }
                 for range_str in list(obj.get("port_range")) {
-                    #[allow(clippy::collapsible_if)]
-                    if let Some((start, end)) = range_str.split_once('-') {
-                        if let (Ok(s), Ok(e)) =
-                            (start.trim().parse::<u16>(), end.trim().parse::<u16>())
-                        {
-                            self.add_port_range(s, e);
-                        }
+                    if let Some((start, end)) = crate::route::rule_set::parse_port_range(&range_str)
+                    {
+                        self.add_port_range(start, end);
                     }
                 }
             }

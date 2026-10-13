@@ -223,3 +223,104 @@ fn lru_eviction_removes_both_reverse_maps_without_persistent_cache() {
     let address = store.lookup_address(last, false).unwrap();
     assert_eq!(store.lookup_domain(address).as_deref(), Some(last));
 }
+
+#[test]
+fn startup_repairs_missing_reverse_and_removes_corrupt_orphan_records() {
+    let path = std::env::temp_dir().join(format!("rust-x-repair-{}.db", std::process::id()));
+    let options = CacheFileOptions {
+        enabled: true,
+        store_fakeip: true,
+        path: path.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let cache = Arc::new(Mutex::new(
+        CacheFile::open(options.clone()).unwrap().unwrap(),
+    ));
+    {
+        let mut file = cache.lock().unwrap();
+        file.put("fakeip_domain4", b"restored.example", vec![198, 18, 0, 12]);
+        file.put(
+            "fakeip_domain4",
+            b"wrong-family.example",
+            "fc00::a"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+                .to_vec(),
+        );
+        file.put(
+            "fakeip_address",
+            &[198, 18, 0, 13],
+            b"orphan.example".to_vec(),
+        );
+        file.put(
+            "fakeip_address",
+            b"invalid-key",
+            b"garbage.example".to_vec(),
+        );
+        file.flush().unwrap();
+    }
+    let store = pool();
+    store.attach_cache(Some(cache.clone()));
+    assert_eq!(
+        store
+            .lookup_domain("198.18.0.12".parse().unwrap())
+            .as_deref(),
+        Some("restored.example")
+    );
+    assert!(
+        store
+            .lookup_address("wrong-family.example", false)
+            .is_none()
+    );
+    {
+        let mut file = cache.lock().unwrap();
+        assert!(file.get("fakeip_address", &[198, 18, 0, 13]).is_none());
+        assert!(file.get("fakeip_address", b"invalid-key").is_none());
+        file.flush().unwrap();
+    }
+    drop((store, cache));
+    let cache = Arc::new(Mutex::new(CacheFile::open(options).unwrap().unwrap()));
+    let reopened = pool();
+    reopened.attach_cache(Some(cache));
+    assert_eq!(
+        reopened
+            .lookup_domain("198.18.0.12".parse().unwrap())
+            .as_deref(),
+        Some("restored.example")
+    );
+    drop(reopened);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn persistent_lru_eviction_deletes_both_records_and_preserves_other_family() {
+    let path = std::env::temp_dir().join(format!("rust-x-evict-disk-{}.db", std::process::id()));
+    let cache = Arc::new(Mutex::new(
+        CacheFile::open(CacheFileOptions {
+            enabled: true,
+            store_fakeip: true,
+            path: path.to_string_lossy().into_owned(),
+            flush_interval: std::time::Duration::from_secs(3600),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap(),
+    ));
+    let store = pool();
+    store.attach_cache(Some(cache.clone()));
+    let old4 = store.create("first.example", false).unwrap();
+    let old6 = store.create("first.example", true).unwrap();
+    for n in 0..16384 {
+        store.create(&format!("new-{n}.example"), false).unwrap();
+    }
+    let file = cache.lock().unwrap();
+    assert!(file.get("fakeip_domain4", b"first.example").is_none());
+    let IpAddr::V4(addr) = old4 else { panic!() };
+    assert!(file.get("fakeip_address", &addr.octets()).is_none());
+    assert_eq!(store.lookup_domain(old6).as_deref(), Some("first.example"));
+    drop(file);
+    cache.lock().unwrap().flush().unwrap();
+    drop((store, cache));
+    std::fs::remove_file(path).unwrap();
+}

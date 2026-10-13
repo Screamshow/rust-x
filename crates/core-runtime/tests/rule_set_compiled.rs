@@ -546,3 +546,127 @@ fn the_index_reports_what_it_holds() {
         "the fallback's port 443 still matches"
     );
 }
+
+#[test]
+fn discord_colon_tuple_matches_in_interpreter_and_compiled_paths() {
+    for separator in [":", "-"] {
+        let rule = json!({"network":"udp","ip_cidr":["104.16.0.0/12"],"port_range":[format!("19294{separator}19344")]});
+        // Logical wrapping exercises the compiled fallback tree too.
+        for entry in [
+            rule.clone(),
+            json!({"type":"logical","mode":"and","rules":[rule.clone()]}),
+        ] {
+            let set = RuleSet::new(vec!["discord".into()], vec![entry.clone()]);
+            for (ip, port, network, expected) in [
+                ("104.29.155.207", 19314, "udp", true),
+                ("104.29.155.207", 19294, "udp", true),
+                ("104.29.155.207", 19344, "udp", true),
+                ("104.29.155.207", 19293, "udp", false),
+                ("104.29.155.207", 19345, "udp", false),
+                ("105.29.155.207", 19314, "udp", false),
+                ("104.29.155.207", 19314, "tcp", false),
+            ] {
+                let ctx = ConnContext::new(
+                    "tproxy-in",
+                    "192.168.90.201:40000".parse().unwrap(),
+                    Target::Ip(format!("{ip}:{port}").parse().unwrap()),
+                    network,
+                );
+                assert_eq!(
+                    match_rule(&entry, &ctx),
+                    expected,
+                    "interpreter {entry} {ip}:{port}/{network}"
+                );
+                assert_eq!(
+                    set.matches(&ctx),
+                    expected,
+                    "compiled {entry} {ip}:{port}/{network}"
+                );
+            }
+        }
+    }
+    for (range, port, expected) in [
+        (":100", 100, true),
+        ("200:", 65535, true),
+        ("200:100", 150, false),
+        ("bad:100", 50, false),
+        ("19294:19344:1", 19314, false),
+    ] {
+        let rule = json!({"source_port_range":[range]});
+        let ctx = ConnContext::new(
+            "tproxy-in",
+            format!("192.168.90.201:{port}").parse().unwrap(),
+            Target::Ip("104.29.155.207:19314".parse().unwrap()),
+            "udp",
+        );
+        assert_eq!(match_rule(&rule, &ctx), expected);
+        assert_eq!(
+            RuleSet::new(vec!["source".into()], vec![rule]).matches(&ctx),
+            expected
+        );
+    }
+}
+
+#[test]
+fn mmap_compiler_accepts_colon_and_legacy_port_ranges() {
+    use core_runtime::route::mmap_set::{MmapRuleSet, RuleSetCompiler};
+    for (n, range) in ["19294:19344", "19294-19344"].iter().enumerate() {
+        let path = std::env::temp_dir().join(format!(
+            "rust-x-discord-port-{}-{n}.tsrs",
+            std::process::id()
+        ));
+        let bytes = RuleSetCompiler::new()
+            .compile(&[json!({"port_range":[range]})])
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let set = MmapRuleSet::open(&path).unwrap();
+        for (port, expected) in [
+            (19293, false),
+            (19294, true),
+            (19314, true),
+            (19344, true),
+            (19345, false),
+        ] {
+            let ctx = ConnContext::new(
+                "tproxy-in",
+                "192.168.90.201:40000".parse().unwrap(),
+                Target::Ip(format!("104.29.155.207:{port}").parse().unwrap()),
+                "udp",
+            );
+            assert_eq!(set.matches(&ctx), expected, "{range}/{port}");
+        }
+        drop(set);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn discord_packet_routes_to_proxy_and_fallback_overwrites_sniff_metadata() {
+    use core_runtime::route::{Decision, Router};
+    let root = json!({"outbounds":[{"type":"direct","tag":"dis_youtube-out"},{"type":"direct","tag":"direct-out"}],"route":{"final":"direct-out","rule_set":[{"type":"inline","tag":"discord","rules":[{"network":"udp","ip_cidr":["104.16.0.0/12"],"port_range":["19294:19344"]}]}],"rules":[{"inbound":"tproxy-in","action":"sniff"},{"rule_set":"discord","outbound":"dis_youtube-out"}]}});
+    let router = Router::new(&root).unwrap();
+    for (port, expected) in [(19314, "dis_youtube-out"), (19345, "direct-out")] {
+        let mut ctx = ConnContext::new(
+            "tproxy-in",
+            "192.168.90.201:40000".parse().unwrap(),
+            Target::Ip(format!("104.29.155.207:{port}").parse().unwrap()),
+            "udp",
+        );
+        let decision = router
+            .route_packet(&mut ctx, b"discord voice payload")
+            .await
+            .unwrap();
+        let Decision::Outbound(index) = decision else {
+            panic!("outbound expected")
+        };
+        assert_eq!(Some(index), router.index_of(expected));
+        if expected == "direct-out" {
+            assert_eq!(
+                ctx.matched_rule,
+                Some(("final".into(), "direct-out".into()))
+            );
+        } else {
+            assert!(!ctx.matched_rule.unwrap().0.contains("sniff"));
+        }
+    }
+}

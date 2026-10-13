@@ -709,7 +709,7 @@ fn log_entry(requested: &str, level: logging::Level, message: &str) -> String {
     json!({"type": name, "payload": message}).to_string()
 }
 
-/// `GET /traffic`: one JSON object per second with the running totals.
+/// `GET /traffic`: one JSON object per second with bytes per elapsed second.
 async fn stream_traffic(
     stream: &mut TcpStream,
     cors: &[String],
@@ -718,11 +718,50 @@ async fn stream_traffic(
     let mut out = Live::open(stream, cors, ws_key).await?;
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.tick().await;
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (_, mut prev_up, mut prev_down) = clash_state::snapshot();
+    let mut previous = tokio::time::Instant::now();
     loop {
         ticker.tick().await;
+        let now = tokio::time::Instant::now();
         let (_, up, down) = clash_state::snapshot();
-        out.send(&json!({"up": up, "down": down}).to_string())
+        let elapsed = now.duration_since(previous);
+        let rate_up = traffic_rate(up, prev_up, elapsed);
+        let rate_down = traffic_rate(down, prev_down, elapsed);
+        previous = now;
+        prev_up = up;
+        prev_down = down;
+        out.send(&json!({"up": rate_up, "down": rate_down}).to_string())
             .await?;
+    }
+}
+
+fn traffic_rate(current: u64, previous: u64, elapsed: Duration) -> u64 {
+    let nanos = elapsed.as_nanos();
+    if nanos == 0 {
+        return 0;
+    }
+    ((u128::from(current.saturating_sub(previous)) * 1_000_000_000 / nanos)
+        .min(u128::from(u64::MAX))) as u64
+}
+
+fn process_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: sysconf reads a process-wide system constant.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return 0;
+        }
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|raw| raw.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_mul(page_size as u64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
     }
 }
 
@@ -734,7 +773,7 @@ fn connections_snapshot() -> Value {
         "downloadTotal": down,
         "uploadTotal": up,
         "connections": connections,
-        "memory": 0,
+        "memory": process_rss_bytes(),
     })
 }
 
@@ -1781,6 +1820,31 @@ async fn send(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn traffic_rates_use_elapsed_time_and_handle_counter_reset() {
+        assert_eq!(
+            super::traffic_rate(3100, 100, std::time::Duration::from_secs(3)),
+            1000
+        );
+        assert_eq!(
+            super::traffic_rate(1100, 100, std::time::Duration::from_millis(500)),
+            2000
+        );
+        assert_eq!(
+            super::traffic_rate(0, 100, std::time::Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(
+            super::traffic_rate(100, 100, std::time::Duration::from_secs(1)),
+            0
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connections_snapshot_reports_live_rss() {
+        assert!(super::connections_snapshot()["memory"].as_u64().unwrap() > 0);
+    }
+
     use super::*;
 
     fn api(secret: Option<&str>) -> ClashApi {

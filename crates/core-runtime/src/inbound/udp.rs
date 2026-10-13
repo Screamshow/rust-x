@@ -65,6 +65,12 @@ enum FlowKind {
 }
 
 impl Flow {
+    fn record_upload(&self, bytes: usize) {
+        if let Some(tracker) = &self.tracker {
+            tracker.add_upload(bytes as u64);
+        }
+    }
+
     fn touch(&self) {
         self.last_ms.store(now_ms(), Ordering::Relaxed);
     }
@@ -103,8 +109,10 @@ impl Flow {
                 let Some(pkt) = next else {
                     break;
                 };
-                if let FlowKind::Outbound { sock } = &self.kind {
-                    let _ = sock.send(&pkt).await;
+                if let FlowKind::Outbound { sock } = &self.kind
+                    && let Ok(n) = sock.send(&pkt).await
+                {
+                    self.record_upload(n);
                 }
             }
             self.writing.store(false, Ordering::Release);
@@ -381,7 +389,8 @@ impl UdpHub {
             return true;
         }
         match sock.try_send(payload) {
-            Ok(_) => {
+            Ok(n) => {
+                flow.record_upload(n);
                 flow.touch();
                 true
             }
@@ -522,7 +531,8 @@ impl UdpHub {
         match &flow.kind {
             FlowKind::Dns => self.hijack_one(reply, source, dest, payload, tag).await,
             FlowKind::Outbound { sock } => {
-                sock.send(payload).await?;
+                let n = sock.send(payload).await?;
+                flow.record_upload(n);
                 Ok(())
             }
         }
@@ -851,6 +861,9 @@ fn spawn_reverse(
                     if !hub.touch_flow(key, &outbound) {
                         return;
                     }
+                    if let Some(tracker) = &tracker {
+                        tracker.add_download(n as u64);
+                    }
                     let framed: &[u8] = if frame == DatagramFrame::Raw {
                         &buf[..n]
                     } else {
@@ -886,6 +899,62 @@ fn spawn_reverse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn udp_tracker_counts_first_fast_queued_and_reverse_payloads() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let source = reply.local_addr().unwrap();
+        let dest = server.local_addr().unwrap();
+        let hub = UdpHub::new(
+            direct_test_router(),
+            Duration::from_secs(60),
+            DatagramFrame::Raw,
+        );
+        hub.handle(
+            Reply::Socket(Arc::downgrade(&reply)),
+            source,
+            dest,
+            b"first",
+            "test",
+        )
+        .await
+        .unwrap();
+        let mut buffer = [0u8; 128];
+        let (_, peer) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hub.try_existing(source, dest, b"fast"));
+        tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let flow = hub
+            .flows
+            .read()
+            .unwrap()
+            .get(&(source, dest))
+            .unwrap()
+            .clone();
+        flow.hold_back(b"queued");
+        tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        server.send_to(b"reply", peer).await.unwrap();
+        let count = tokio::time::timeout(Duration::from_secs(2), reply.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..count], b"reply");
+        let id = flow.tracker.as_ref().unwrap().id();
+        let (views, _, _) = crate::clash_state::snapshot();
+        let view = views.iter().find(|view| view.id == id.to_string()).unwrap();
+        assert_eq!(view.upload, 5 + 4 + 6);
+        assert_eq!(view.download, 5);
+        hub.stop();
+    }
 
     fn direct_test_router() -> Arc<Router> {
         Router::new(&serde_json::json!({

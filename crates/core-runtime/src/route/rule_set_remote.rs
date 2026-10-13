@@ -138,9 +138,12 @@ impl RemoteRuleSet {
         if let Some(parent) = cache_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let tmp_path = cache_path.with_extension("tmp");
-        std::fs::write(&tmp_path, &bytes)?;
-        std::fs::rename(&tmp_path, cache_path)?;
+        let already_identical = file_matches(cache_path, &bytes);
+        if !already_identical {
+            let tmp_path = cache_path.with_extension("tmp");
+            std::fs::write(&tmp_path, &bytes)?;
+            std::fs::rename(&tmp_path, cache_path)?;
+        }
         crate::route::mmap_set::MmapRuleSet::open_with_mode(cache_path, self.spec.mode)
             .map_err(|e| io::Error::other(format!("open tsrs: {e}")))
     }
@@ -347,12 +350,19 @@ impl RemoteRuleSet {
                             match crate::route::mmap_set::apply_delta(&base_bytes, &delta_resp.body)
                             {
                                 Ok(new_bytes) => {
-                                    let tmp_path = tsrs_path.with_extension("tmp");
-                                    if let Some(parent) = tsrs_path.parent() {
-                                        let _ = std::fs::create_dir_all(parent);
-                                    }
-                                    let _ = std::fs::write(&tmp_path, &new_bytes);
-                                    if std::fs::rename(&tmp_path, &tsrs_path).is_ok() {
+                                    let already_identical = file_matches(&tsrs_path, &new_bytes);
+                                    let write_ok = if !already_identical {
+                                        let tmp_path = tsrs_path.with_extension("tmp");
+                                        if let Some(parent) = tsrs_path.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        std::fs::write(&tmp_path, &new_bytes)
+                                            .and_then(|()| std::fs::rename(&tmp_path, &tsrs_path))
+                                            .is_ok()
+                                    } else {
+                                        true
+                                    };
+                                    if write_ok {
                                         match crate::route::mmap_set::MmapRuleSet::open_with_mode(
                                             &tsrs_path,
                                             self.spec.mode,
@@ -418,12 +428,15 @@ impl RemoteRuleSet {
         let _ = is_start;
 
         if response.body.starts_with(b"TSRS") {
-            if let Some(parent) = tsrs_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            let already_identical = file_matches(&tsrs_path, &response.body);
+            if !already_identical {
+                if let Some(parent) = tsrs_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let tmp_path = tsrs_path.with_extension("tmp");
+                std::fs::write(&tmp_path, &response.body)?;
+                std::fs::rename(&tmp_path, &tsrs_path)?;
             }
-            let tmp_path = tsrs_path.with_extension("tmp");
-            std::fs::write(&tmp_path, &response.body)?;
-            std::fs::rename(&tmp_path, &tsrs_path)?;
             let mmap_set =
                 crate::route::mmap_set::MmapRuleSet::open_with_mode(&tsrs_path, self.spec.mode)
                     .map_err(|e| io::Error::other(format!("open downloaded tsrs: {e}")))?;
@@ -488,9 +501,6 @@ impl RemoteRuleSet {
             self.tag().as_bytes(),
             saved_binary::marshal(&saved),
         );
-        if let Err(error) = guard.flush() {
-            logging::error(format_args!("save rule-set updated time: {error}"));
-        }
     }
 }
 
@@ -650,9 +660,87 @@ fn parse_binary(data: &[u8]) -> io::Result<Vec<Value>> {
         .map_err(|error| io::Error::other(format!("read rule-set: {error}")))
 }
 
+/// Compare with fixed scratch space; do not duplicate a large mmap ruleset.
+pub(crate) fn file_matches(path: &std::path::Path, bytes: &[u8]) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|meta| meta.len() == bytes.len() as u64)
+    {
+        return false;
+    }
+    let mut scratch = [0u8; 8192];
+    for chunk in bytes.chunks(scratch.len()) {
+        if file.read_exact(&mut scratch[..chunk.len()]).is_err() || &scratch[..chunk.len()] != chunk
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Atomic replacement also protects an existing mmap during reload preparation.
+pub(crate) fn write_tsrs_if_changed(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    if file_matches(path, bytes) {
+        return Ok(());
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_tsrs_keeps_file_and_changed_tsrs_preserves_old_mapping() {
+        let path =
+            std::env::temp_dir().join(format!("rust-x-tsrs-noop-{}.bin", std::process::id()));
+        let first = vec![0x11; 20_000];
+        write_tsrs_if_changed(&path, &first).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let map = crate::route::mmap_set::mmap_io::MmapBuffer::open(&path).unwrap();
+        write_tsrs_if_changed(&path, &first).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+        let second = vec![0x22; 20_000];
+        write_tsrs_if_changed(&path, &second).unwrap();
+        assert_eq!(&map[..], &first);
+        assert!(file_matches(&path, &second));
+        assert!(!file_matches(&path, &first));
+        drop(map);
+        std::fs::remove_file(path).unwrap();
+    }
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

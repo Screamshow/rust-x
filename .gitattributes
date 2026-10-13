@@ -3,3 +3,6 @@
 *.jpg binary
 *.ico binary
 *.db binary
+
+# Preserve the original third-party source formatting and license texts.
+vendor/blake3/** -whitespace
