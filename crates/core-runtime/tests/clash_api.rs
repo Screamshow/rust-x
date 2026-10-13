@@ -693,3 +693,36 @@ async fn external_ui_is_downloaded_and_mounted_under_ui() {
     instance.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn manual_delay_uses_the_requested_plain_http_endpoint() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let target = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        assert!(
+            String::from_utf8(head)
+                .unwrap()
+                .starts_with("HEAD /requested HTTP/1.1")
+        );
+        // The API's existing contract treats a rounded zero-ms delay as failure.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let instance=core_runtime::start(&serde_json::json!({"experimental":{"clash_api":{"external_controller":"127.0.0.1:0"}},"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}})).await.unwrap();
+    let url = format!("http%3A%2F%2F127.0.0.1%3A{}%2Frequested", endpoint.port());
+    let response=tokio::time::timeout(Duration::from_secs(3),request(instance.clash_api_addr().unwrap(),&format!("GET /proxies/direct/delay?timeout=1500&url={url} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"))).await.unwrap();
+    assert_eq!(response.status, 200, "{}", response.text());
+    assert!(response.json()["delay"].is_number());
+    target.await.unwrap();
+    instance.shutdown_wait().await;
+}

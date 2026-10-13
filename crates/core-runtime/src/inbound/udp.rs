@@ -103,34 +103,65 @@ impl Flow {
     /// once so a push that raced the release cannot be stranded with no
     /// writer looking at it.
     async fn drain_backlog(self: Arc<Self>) {
+        let mut writing = WritingGuard(Some(&self));
         loop {
             loop {
                 let next = self.backlog.lock().expect("backlog").pop_front();
                 let Some(pkt) = next else {
                     break;
                 };
-                if let FlowKind::Outbound { sock } = &self.kind
-                    && let Ok(n) = sock.send(&pkt).await
-                {
-                    self.record_upload(n);
+                if let FlowKind::Outbound { sock } = &self.kind {
+                    let result = tokio::select! {
+                        result = tokio::time::timeout(self.timeout, sock.send(&pkt)) => result,
+                        _ = async {
+                            if let Some(tracker) = &self.tracker { tracker.close_signal().wait().await; }
+                            else { std::future::pending::<()>().await; }
+                        } => return,
+                    };
+                    match result {
+                        Ok(Ok(n)) => self.record_upload(n),
+                        _ => {
+                            self.backlog.lock().expect("backlog").clear();
+                            if let Some(tracker) = &self.tracker {
+                                crate::clash_state::close(tracker.id());
+                            }
+                            return;
+                        }
+                    }
                 }
             }
+            writing.0 = None;
             self.writing.store(false, Ordering::Release);
             if self.backlog.lock().expect("backlog").is_empty() {
                 return;
             }
             if self.writing.swap(true, Ordering::AcqRel) {
-                // a pusher beat us to the flag and spawned its own writer
                 return;
             }
-            // we reclaimed the racing push ourselves
+            writing.0 = Some(&self);
         }
+    }
+}
+
+struct WritingGuard<'a>(Option<&'a Flow>);
+impl Drop for WritingGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(flow) = self.0 {
+            flow.writing.store(false, Ordering::Release);
+        }
+    }
+}
+
+pub(crate) struct StopHub(pub(crate) Arc<UdpHub>);
+impl Drop for StopHub {
+    fn drop(&mut self) {
+        self.0.stop();
     }
 }
 
 static START_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     let epoch = START_EPOCH.get_or_init(Instant::now);
     epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -770,6 +801,7 @@ where
         Duration::ZERO,
         DatagramFrame::LengthPrefixed,
     );
+    let _stop_hub = StopHub(Arc::clone(&hub));
     let reply = Reply::Stream(writer);
     let mut len = [0u8; 2];
     loop {
@@ -898,6 +930,50 @@ fn spawn_reverse(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stream_eof_releases_the_dedicated_udp_hub() {
+        use tokio::io::AsyncWriteExt;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dest = server.local_addr().unwrap();
+        let (mut caller, reader) = tokio::io::duplex(1024);
+        let writer = Arc::new(tokio::sync::Mutex::new(
+            Box::new(tokio::io::sink()) as AnyWrite
+        ));
+        let router = direct_test_router();
+        let relay = tokio::spawn(async move {
+            relay_stream_datagrams(
+                reader,
+                writer,
+                "127.0.0.1:12345".parse().unwrap(),
+                dest,
+                "test",
+                &router,
+            )
+            .await
+        });
+        caller.write_all(b"\x00\x04ping").await.unwrap();
+        let mut bytes = [0; 16];
+        let (_, peer) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(caller);
+        let _ = tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if UdpSocket::bind(peer).await.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("UDP socket leaked after stream EOF");
+    }
+
     use super::*;
 
     #[tokio::test]

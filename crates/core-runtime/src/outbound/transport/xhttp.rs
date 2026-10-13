@@ -9,15 +9,12 @@
 //!
 //! Modes: packet-up (GET download + sequential POST packets), stream-up
 //! (streamed POST upload + GET download), stream-one (one bidirectional
-//! stream), auto (REALITY → stream-one, otherwise packet-up — REALITY is not
-//! implemented yet, so auto currently resolves to packet-up).
+//! stream). Auto currently preserves packet-up; explicit stream-one can use
+//! a pooled HTTP/2 connection when negotiated.
 //!
-//! HTTP/1.1 and nothing else, because that is what the reference speaks. It
-//! refuses h2 on this transport even when the server offers it, on purpose, and
-//! the two connections the protocol wants — a `Connection: close` download GET
-//! and keep-alive pooled upload POSTs — are why the transport layer hands us a
-//! dialer: HTTP/1.1 does not multiplex, so a second request means a second
-//! connection, and ALPN is decided per connection.
+//! The split modes use a `Connection: close` HTTP/1.1 download GET and pooled
+//! keep-alive upload POSTs. Their separate connections are provided by the
+//! transport dialer; ALPN is decided per mode and connection.
 
 use std::future::Future;
 use std::io;
@@ -26,7 +23,7 @@ use std::task::{Context, Poll, ready};
 
 use bytes::{Bytes, BytesMut};
 use serde_json::{Map, Value};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -721,11 +718,17 @@ pub(crate) async fn connect(
         None,
         false,
     )?;
-    let (head, pending) = h1io::send(&mut io, &request, &authority, b"", true)
-        .await
-        .map_err(|e| io::Error::other(format!("xhttp: download: {e}")))?;
-    h1io::expect_ok(&head, "download")?;
-    this.spawn_pump(h1io::Body::new(io, &head, pending));
+    let mut head_bytes = Vec::with_capacity(256);
+    h1io::write_head(
+        &mut head_bytes,
+        &request,
+        &authority,
+        h1io::Framing::None,
+        true,
+    );
+    io.write_all(&head_bytes).await?;
+    io.flush().await?;
+    this.spawn_download_stream(io);
 
     match mode {
         Mode::StreamUp => {
@@ -825,21 +828,22 @@ struct PostWriter {
 impl PostWriter {
     /// A keep-alive connection for one upload POST, out of the pool when there
     /// is a free one and dialled when there is not.
-    async fn connection(&self) -> io::Result<(std::sync::Arc<super::xmux::Client>, AnyStream)> {
+    async fn connection(&self) -> io::Result<(super::xmux::Lease, AnyStream)> {
         if let Some(client) = self.cfg.pool.acquire().await {
-            if let Some(io) = client.take() {
-                return Ok((client, io));
+            let mut lease = super::xmux::Lease::new(client);
+            if let Some(io) = lease.take() {
+                return Ok((lease, io));
             }
-            self.cfg.pool.release(&client).await;
         }
         let io = (self.dialer)().await?;
         let client = self.cfg.pool.insert(io).await;
         // `insert` parks the connection in the pool, and the pool is the only
         // owner, so it comes back out through the same door
-        let io = client
+        let mut lease = super::xmux::Lease::new(client);
+        let io = lease
             .take()
             .ok_or_else(|| io::Error::other("xhttp: pooled connection unavailable"))?;
-        Ok((client, io))
+        Ok((lease, io))
     }
 
     /// Send one upload chunk as a single sequenced POST (reference
@@ -918,34 +922,18 @@ impl PostWriter {
         }
         let payload = payload.unwrap_or_default();
 
-        let (client, io) = self.connection().await?;
-        // one HTTP request against the pool's h_max_request_times: a packet-up
-        // stream issues one POST per write, and a connection that ignored those
-        // would outlive the limit the server was told about
-        client.take_request();
-        let mut body = match Self::post(io, &req, &self.authority, &payload).await {
-            Ok((head, body)) => {
-                if let Err(e) = h1io::expect_ok(&head, "upload") {
-                    self.cfg.pool.release(&client).await;
-                    return Err(e);
-                }
-                body
-            }
-            Err(e) => {
-                self.cfg.pool.release(&client).await;
-                return Err(e);
-            }
-        };
-        // Drain the (usually empty) response body, so the connection is whole
-        // again and can carry the next POST.
-        let drained = body.drain().await;
-        if drained.is_ok()
-            && let Some(io) = body.into_inner()
-        {
-            client.give(io);
+        let (lease, io) = self.connection().await?;
+        lease.client.take_request();
+        // Never replay a POST after an ambiguous response failure: the peer
+        // may already have accepted this sequence and its payload.
+        let (head, mut body) = Self::post(io, &req, &self.authority, &payload).await?;
+        h1io::expect_ok(&head, "upload")?;
+        body.drain().await?;
+        if let Some(io) = body.into_inner() {
+            lease.client.give(io);
         }
-        self.cfg.pool.release(&client).await;
-        drained
+        // Drop returns usage, and retires a connection with no complete body.
+        Ok(())
     }
 
     /// One `Content-Length` POST plus its response head, over one connection.
@@ -1004,12 +992,29 @@ impl SplitConn {
         }
     }
 
-    /// Feed the download channel from a response body, until it ends or the
-    /// reader goes away.
-    fn spawn_pump(&mut self, body: h1io::Body) {
+    /// Read GET headers concurrently with upload; a server may await the
+    /// first VLESS payload before answering the download request.
+    fn spawn_download_stream(&mut self, mut io: AnyStream) {
         let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
         self.dl = rx;
-        self.dl_task = tokio::spawn(pump(body, tx));
+        self.dl_task = tokio::spawn(async move {
+            let (head, pending) = match h1io::read_head(&mut io).await {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = tx
+                        .send(Err(io::Error::other(format!(
+                            "xhttp: download head: {error}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+            if let Err(error) = h1io::expect_ok(&head, "download") {
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+            pump(h1io::Body::new(io, &head, pending), tx).await;
+        });
     }
 
     /// The upload request's response when it *is* the download stream, which is
@@ -1677,6 +1682,130 @@ mod tests {
     /// `Connection: close` download GET on the connection it was handed, and the
     /// seq-numbered upload POST on a second connection from the dialer, each with
     /// padding. The download body must flow back through the conn.
+
+    #[tokio::test]
+    async fn download_head_waiting_for_first_post_does_not_deadlock() {
+        let (client_io, mut download) = tokio::io::duplex(65536);
+        let (post_tx, mut post_rx) = mpsc::unbounded_channel();
+        let dialer: std::sync::Arc<super::Dialer> = std::sync::Arc::new(move || {
+            let post_tx = post_tx.clone();
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(65536);
+                post_tx.send(server).unwrap();
+                Ok(Box::new(client) as AnyStream)
+            })
+        });
+        let server = tokio::spawn(async move {
+            let head = read_request_head(&mut download).await;
+            assert!(head.starts_with("GET "));
+            // Delay all download response bytes until upload is received.
+            let mut upload = post_rx.recv().await.unwrap();
+            let head = read_request_head(&mut upload).await;
+            assert!(head.starts_with("POST "));
+            let mut payload = [0; 4];
+            upload.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            upload
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            download
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong")
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let config = cfg(json!({"path":"/xhttp","mode":"packet-up"}));
+            let mut connection =
+                super::connect(Box::new(client_io), false, "srv", 80, &config, dialer)
+                    .await
+                    .unwrap();
+            connection.write_all(b"ping").await.unwrap();
+            connection.flush().await.unwrap();
+            let mut reply = [0; 4];
+            connection.read_exact(&mut reply).await.unwrap();
+            assert_eq!(&reply, b"pong");
+            server.await.unwrap();
+        })
+        .await
+        .expect("GET/upload deadlock");
+    }
+
+    #[tokio::test]
+    async fn rejected_download_header_reaches_the_reader() {
+        let (client, mut server) = tokio::io::duplex(65536);
+        let task = tokio::spawn(async move {
+            read_request_head(&mut server).await;
+            server
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let dialer: std::sync::Arc<super::Dialer> =
+            std::sync::Arc::new(|| Box::pin(async { Err(io::Error::other("unused dial")) }));
+        let config = cfg(json!({"path":"/xhttp","mode":"packet-up"}));
+        let mut connection = super::connect(Box::new(client), false, "srv", 80, &config, dialer)
+            .await
+            .unwrap();
+        let mut byte = [0];
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            connection.read(&mut byte),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("403"));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_upload_is_not_replayed_and_next_attempt_dials_fresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls = count.clone();
+        let dialer: std::sync::Arc<super::Dialer> = std::sync::Arc::new(move || {
+            let calls = calls.clone();
+            Box::pin(async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                let (client, mut server) = tokio::io::duplex(65536);
+                tokio::spawn(async move {
+                    read_request_head(&mut server).await;
+                    let mut body = [0; 4];
+                    server.read_exact(&mut body).await.unwrap();
+                    if n == 0 {
+                        assert_eq!(&body, b"lost");
+                        return;
+                    }
+                    assert_eq!(&body, b"next");
+                    server
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut byte = [0];
+                    let _ = server.read(&mut byte).await;
+                });
+                Ok(Box::new(client) as AnyStream)
+            })
+        });
+        let mut writer = PostWriter {
+            cfg: cfg(json!({"path":"/xhttp"})),
+            scheme: "http".into(),
+            authority: "srv".into(),
+            session_id: "test-session".into(),
+            seq: 0,
+            dialer,
+        };
+        assert!(writer.send_packet(b"lost").await.is_err());
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "ambiguous POST must not replay"
+        );
+        writer.send_packet(b"next").await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn wire_packet_up_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

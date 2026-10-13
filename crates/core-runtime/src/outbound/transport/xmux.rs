@@ -225,9 +225,17 @@ impl Client {
         self.left_requests.fetch_sub(1, Ordering::SeqCst);
     }
 
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let _ = self.take();
+    }
+
     fn evict_cause(&self) -> Option<&'static str> {
         if self.closed.load(Ordering::SeqCst) {
             return Some("closed");
+        }
+        if !self.has_io() && self.open_usage.load(Ordering::SeqCst) == 0 {
+            return Some("no_io");
         }
         if self.left_usage.load(Ordering::SeqCst) == 0 {
             return Some("reuse");
@@ -250,6 +258,36 @@ impl Client {
 
     fn release(&self) {
         self.open_usage.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One upload request owns one usage slot across every await.
+pub(crate) struct Lease {
+    pub(crate) client: Arc<Client>,
+    taken: bool,
+}
+impl Lease {
+    pub(crate) fn new(client: Arc<Client>) -> Self {
+        Self {
+            client,
+            taken: false,
+        }
+    }
+    pub(crate) fn take(&mut self) -> Option<AnyStream> {
+        let io = self.client.take();
+        self.taken = io.is_some();
+        io
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if self.taken && !self.client.has_io() {
+            self.client.close();
+        }
+        self.client.release();
+        if self.client.closed.load(Ordering::SeqCst) {
+            let _ = self.client.take();
+        }
     }
 }
 
@@ -330,6 +368,7 @@ impl Pool {
         client
     }
 
+    #[cfg(test)]
     pub(crate) async fn release(&self, client: &Arc<Client>) {
         client.release();
         // a connection that fell out of the pool while it was still in use is
@@ -351,6 +390,28 @@ fn pick(len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelled_request_releases_usage_and_removes_incomplete_connection() {
+        let pool = Pool::new(XmuxConfig::parse(None, "pool").unwrap());
+        let (io, _peer) = tokio::io::duplex(1024);
+        let client = pool.insert(Box::new(io)).await;
+        let held = client.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            let mut lease = Lease::new(held);
+            let _io = lease.take().unwrap();
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        assert_eq!(client.open_usage.load(Ordering::SeqCst), 1);
+        request.abort();
+        let _ = request.await;
+        assert_eq!(client.open_usage.load(Ordering::SeqCst), 0);
+        assert!(client.closed.load(Ordering::SeqCst));
+        assert!(pool.acquire().await.is_none());
+    }
+
     use super::*;
 
     fn range(value: serde_json::Value) -> IntRange {
