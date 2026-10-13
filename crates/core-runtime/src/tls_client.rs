@@ -17,6 +17,16 @@ use tokio_rustls::client::TlsStream;
 
 use crate::inbound::AnyStream;
 
+const TLS_CONFIG_CACHE_CAPACITY: usize = 32;
+type TlsConfigKey = (bool, bool, bool, Vec<Vec<u8>>, Vec<String>, u64);
+type TlsConfigCache = lru::LruCache<TlsConfigKey, Arc<rustls::ClientConfig>>;
+
+fn new_tls_config_cache() -> std::sync::Mutex<TlsConfigCache> {
+    std::sync::Mutex::new(TlsConfigCache::new(
+        std::num::NonZeroUsize::new(TLS_CONFIG_CACHE_CAPACITY).unwrap(),
+    ))
+}
+
 const DANGEROUS_SCHEMES: &[rustls::SignatureScheme] = &[
     rustls::SignatureScheme::ED25519,
     rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
@@ -442,13 +452,19 @@ impl TlsOptions {
         versions: &[&'static rustls::SupportedProtocolVersion],
         alpn: &[Vec<u8>],
     ) -> io::Result<Arc<rustls::ClientConfig>> {
-        use std::collections::HashMap;
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<TlsConfigCache>> =
+            std::sync::OnceLock::new();
+        self.client_config_cached(versions, alpn, CACHE.get_or_init(new_tls_config_cache))
+    }
+
+    fn client_config_cached(
+        &self,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        alpn: &[Vec<u8>],
+        cache: &std::sync::Mutex<TlsConfigCache>,
+    ) -> io::Result<Arc<rustls::ClientConfig>> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher as _};
-        use std::sync::{Mutex, OnceLock};
-
-        type Key = (bool, bool, bool, Vec<Vec<u8>>, Vec<String>, u64);
-        static CACHE: OnceLock<Mutex<HashMap<Key, Arc<rustls::ClientConfig>>>> = OnceLock::new();
 
         let mut ca = DefaultHasher::new();
         for cert in &self.ca_certs {
@@ -462,7 +478,6 @@ impl TlsOptions {
             self.cipher_suites.clone(),
             ca.finish(),
         );
-        let cache = CACHE.get_or_init(Mutex::default);
         if let Some(config) = cache.lock().expect("tls config cache").get(&key) {
             return Ok(Arc::clone(config));
         }
@@ -497,10 +512,14 @@ impl TlsOptions {
         };
         config.alpn_protocols = alpn.to_vec();
         let config = Arc::new(config);
-        cache
-            .lock()
-            .expect("tls config cache")
-            .insert(key, Arc::clone(&config));
+        // A concurrent miss may have installed this key while we built it.
+        // Reuse that entry; eviction only drops the cache's reference, so
+        // configurations still held by active connections remain valid.
+        let mut cache = cache.lock().expect("tls config cache");
+        if let Some(existing) = cache.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        cache.put(key, Arc::clone(&config));
         Ok(config)
     }
 
@@ -857,6 +876,35 @@ mod tests {
     fn options(value: Value) -> anyhow::Result<Option<TlsOptions>> {
         let obj = value.as_object().expect("an object").clone();
         TlsOptions::from_outbound(&obj, "example.com", "443")
+    }
+
+    #[test]
+    fn tls_config_cache_evicts_old_entries_without_invalidating_live_configs() {
+        let tls = options(json!({"tls": {"enabled": true}})).unwrap().unwrap();
+        let cache = new_tls_config_cache();
+        let versions = &[&rustls::version::TLS13];
+        let first_alpn = vec![b"first".to_vec()];
+        let first = tls
+            .client_config_cached(versions, &first_alpn, &cache)
+            .unwrap();
+        let repeated = tls
+            .client_config_cached(versions, &first_alpn, &cache)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &repeated));
+        drop(repeated);
+        for index in 0..TLS_CONFIG_CACHE_CAPACITY {
+            let alpn = vec![format!("entry-{index}").into_bytes()];
+            tls.client_config_cached(versions, &alpn, &cache).unwrap();
+        }
+        assert_eq!(cache.lock().unwrap().len(), TLS_CONFIG_CACHE_CAPACITY);
+        assert_eq!(Arc::strong_count(&first), 1);
+        assert_eq!(first.alpn_protocols, first_alpn);
+        let rebuilt = tls
+            .client_config_cached(versions, &first_alpn, &cache)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert_eq!(rebuilt.alpn_protocols, first.alpn_protocols);
+        assert_eq!(cache.lock().unwrap().len(), TLS_CONFIG_CACHE_CAPACITY);
     }
 
     /// The whole point of the change: a fingerprint in the config is a table we
