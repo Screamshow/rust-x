@@ -13099,6 +13099,7 @@ const KNOWN_OVPN_SERVER_FIELDS: &[&str] = &[
 
 /// reference `option.TailscaleEndpointOptions` + wrapper.
 const KNOWN_TAILSCALE_FIELDS: &[&str] = &[
+    "luci_access",
     "type",
     "tag",
     "state_directory",
@@ -14189,6 +14190,7 @@ fn openvpn_push_dns_servers_decode(i: usize, value: &Value) -> Result<(), String
 
 fn tailscale_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("endpoints[{i}]");
+    if let Some(value)=obj.get("luci_access") { ep_bool(value, &format!("{at}.luci_access"), TS_EP, "luci_access")?; }
     for key in obj.keys() {
         let k = key.as_str();
         if !KNOWN_TAILSCALE_FIELDS.contains(&k) && !DIALER_OUT_FIELDS.contains(&k) {

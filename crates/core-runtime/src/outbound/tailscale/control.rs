@@ -4,6 +4,7 @@
 //! and MapResponse peer/DERP streaming.
 
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -11,9 +12,6 @@ use serde_json::Value;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::outbound::tailscale::derp::DerpMap;
-
-pub const DEFAULT_SERVER_PUBKEY_HEX: &str =
-    "a436df96f7c9e03d4103133ff0be3d65b7dd55745131e5f8f5370ae4f6b4be5e";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Hostinfo {
@@ -29,10 +27,18 @@ fn default_os() -> String {
     "linux".to_string()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AuthObj {
     #[serde(rename = "AuthKey")]
     pub auth_key: String,
+}
+
+impl std::fmt::Debug for AuthObj {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthObj")
+            .field("auth_key", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,10 +53,14 @@ pub struct RegisterRequest {
     pub hostinfo: Hostinfo,
     #[serde(rename = "Ephemeral")]
     pub ephemeral: bool,
+    #[serde(rename = "Followup", default, skip_serializing_if = "Option::is_none")]
+    pub followup: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeObj {
+    #[serde(rename = "HomeDERP", default)]
+    pub home_derp: Option<u16>,
     #[serde(rename = "ID")]
     pub id: u64,
     #[serde(rename = "Key")]
@@ -95,6 +105,9 @@ pub struct MapRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerObj {
+    #[serde(rename="DiscoKey", default)] pub disco_key: Option<String>,
+    #[serde(rename = "HomeDERP", default)]
+    pub home_derp: Option<u16>,
     #[serde(rename = "ID")]
     pub id: u64,
     #[serde(rename = "Key")]
@@ -115,6 +128,12 @@ pub struct PeerObj {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MapResponse {
+    #[serde(rename="PeersChanged", default)] pub peers_changed: Option<Vec<PeerObj>>,
+    #[serde(rename="PeersRemoved", default)] pub peers_removed: Option<Vec<u64>>,
+    #[serde(rename = "PacketFilter", default)]
+    pub packet_filter: Option<Vec<super::access::Rule>>,
+    #[serde(rename = "PacketFilters", default)]
+    pub packet_filters: Option<std::collections::HashMap<String, Option<Vec<super::access::Rule>>>>,
     #[serde(rename = "Node", default)]
     pub node: Option<NodeObj>,
     #[serde(rename = "Peers", default)]
@@ -125,8 +144,10 @@ pub struct MapResponse {
     pub keep_alive: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct PersistedState {
+    #[serde(rename = "Version")]
+    version: u32,
     #[serde(rename = "MachineKey")]
     machine_key: String,
     #[serde(rename = "NodeKey")]
@@ -144,7 +165,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 
 #[allow(clippy::result_unit_err)]
 pub fn from_hex(s: &str, out: &mut [u8]) -> Result<(), ()> {
-    if s.len() != out.len() * 2 {
+    if !s.is_ascii() || s.len() != out.len() * 2 {
         return Err(());
     }
     for (i, byte) in out.iter_mut().enumerate() {
@@ -157,33 +178,76 @@ pub fn from_hex(s: &str, out: &mut [u8]) -> Result<(), ()> {
 pub fn load_or_create_keys(
     state_dir: Option<&Path>,
     ephemeral: bool,
-) -> (StaticSecret, StaticSecret) {
+) -> io::Result<(StaticSecret, StaticSecret)> {
     if !ephemeral && let Some(dir) = state_dir {
         let state_file = dir.join("tailscale.state");
-        if let Ok(content) = fs::read_to_string(&state_file)
-            && let Ok(state) = serde_json::from_str::<PersistedState>(&content)
-            && let (Some(m_bytes), Some(n_bytes)) = (
-                parse_key_hex(&state.machine_key),
-                parse_key_hex(&state.node_key),
-            )
-        {
-            return (StaticSecret::from(m_bytes), StaticSecret::from(n_bytes));
+        match fs::read_to_string(&state_file) {
+            Ok(content) => {
+                let invalid = || {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "tailscale: invalid or legacy key state; explicit identity reset required",
+                    )
+                };
+                let state: PersistedState =
+                    serde_json::from_str(&content).map_err(|_| invalid())?;
+                if state.version != 1 {
+                    return Err(invalid());
+                }
+                let decode = |key: &str| {
+                    let mut bytes = [0u8; 32];
+                    from_hex(key, &mut bytes).map_err(|_| invalid())?;
+                    Ok::<_, io::Error>(StaticSecret::from(bytes))
+                };
+                return Ok((decode(&state.machine_key)?, decode(&state.node_key)?));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
 
         let m_sec = generate_secret();
         let n_sec = generate_secret();
         let state = PersistedState {
-            machine_key: to_hex(PublicKey::from(&m_sec).as_bytes()),
-            node_key: to_hex(PublicKey::from(&n_sec).as_bytes()),
+            version: 1,
+            machine_key: to_hex(&m_sec.to_bytes()),
+            node_key: to_hex(&n_sec.to_bytes()),
         };
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = fs::create_dir_all(dir);
-            let _ = fs::write(state_file, json);
+        let json = serde_json::to_vec(&state).map_err(io::Error::other)?;
+        fs::create_dir_all(dir)?;
+        // A fixed create_new staging file serializes first-time initialization.
+        // Never overwrite an existing identity or accept a partially written file.
+        let staging = dir.join("tailscale.state.new");
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        return (m_sec, n_sec);
+        let mut file = options.open(&staging)?;
+        // Another initializer may have published its state after our first read.
+        if state_file.exists() {
+            drop(file);
+            fs::remove_file(&staging)?;
+            return load_or_create_keys(state_dir, ephemeral);
+        }
+        let result = (|| {
+            file.write_all(&json)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&staging, &state_file)?;
+            #[cfg(unix)]
+            fs::File::open(dir)?.sync_all()?;
+            Ok::<_, io::Error>(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&staging);
+        }
+        result?;
+        return Ok((m_sec, n_sec));
     }
 
-    (generate_secret(), generate_secret())
+    Ok((generate_secret(), generate_secret()))
 }
 
 fn generate_secret() -> StaticSecret {
@@ -216,16 +280,92 @@ pub fn machine_key_str(pk: &PublicKey) -> String {
     format!("mkey:{}", to_hex(pk.as_bytes()))
 }
 
-/// Discovers the server public key for Noise_IK coordination.
-pub fn discover_server_key(_control_url: &str) -> PublicKey {
-    let mut bytes = [0u8; 32];
-    from_hex(DEFAULT_SERVER_PUBKEY_HEX, &mut bytes).expect("valid hex constant");
-    PublicKey::from(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StateDir(std::path::PathBuf);
+
+    impl StateDir {
+        fn new() -> Self {
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).unwrap();
+            Self(std::env::temp_dir().join(format!("rust-x-ts-{}", to_hex(&nonce))))
+        }
+    }
+
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn identity_survives_restart() {
+        let dir = StateDir::new();
+        let first = load_or_create_keys(Some(&dir.0), false).unwrap();
+        let second = load_or_create_keys(Some(&dir.0), false).unwrap();
+        assert_eq!(first.0.to_bytes(), second.0.to_bytes());
+        assert_eq!(first.1.to_bytes(), second.1.to_bytes());
+        assert_eq!(PublicKey::from(&first.1), PublicKey::from(&second.1));
+        assert!(!dir.0.join("tailscale.state.new").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.0.join("tailscale.state"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_state_is_preserved_and_rejected() {
+        let dir = StateDir::new();
+        fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("tailscale.state");
+        for content in [
+            "broken",
+            r#"{"MachineKey":"00","NodeKey":"00"}"#,
+            r#"{"Version":1,"MachineKey":"00","NodeKey":"00"}"#,
+        ] {
+            fs::write(&path, content).unwrap();
+            assert!(matches!(load_or_create_keys(Some(&dir.0), false),
+                Err(err) if err.kind() == io::ErrorKind::InvalidData));
+            assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn ephemeral_identity_does_not_touch_persistent_state() {
+        let dir = StateDir::new();
+        let first = load_or_create_keys(Some(&dir.0), true).unwrap();
+        let second = load_or_create_keys(Some(&dir.0), true).unwrap();
+        assert_ne!(first.0.to_bytes(), second.0.to_bytes());
+        assert!(!dir.0.exists());
+        let persistent = load_or_create_keys(Some(&dir.0), false).unwrap();
+        load_or_create_keys(Some(&dir.0), true).unwrap();
+        let restored = load_or_create_keys(Some(&dir.0), false).unwrap();
+        assert_eq!(persistent.0.to_bytes(), restored.0.to_bytes());
+    }
+
+    #[test]
+    fn persistence_failure_is_reported() {
+        let dir = StateDir::new();
+        fs::create_dir_all(&dir.0).unwrap();
+        fs::write(dir.0.join("tailscale.state.new"), "occupied").unwrap();
+        assert!(load_or_create_keys(Some(&dir.0), false).is_err());
+        assert!(!dir.0.join("tailscale.state").exists());
+    }
+
+    #[test]
+    fn non_ascii_key_is_rejected_without_panic() {
+        assert!(parse_key_hex(&"é".repeat(32)).is_none());
+    }
 
     #[test]
     fn test_register_and_map_response_parsing() {

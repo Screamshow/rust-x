@@ -349,7 +349,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-cli"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "anyhow",
  "base64",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "core-config"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "base64",
  "brotli",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "core-crypto"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -408,11 +408,11 @@ dependencies = [
 
 [[package]]
 name = "core-experimental"
-version = "0.0.15"
+version = "0.0.16"
 
 [[package]]
 name = "core-runtime"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -436,6 +436,7 @@ dependencies = [
  "core-crypto",
  "core-experimental",
  "core-tls",
+ "crypto_box",
  "ctr",
  "des",
  "flate2",
@@ -476,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "core-tls"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "aes-gcm",
  "brotli",
@@ -564,6 +565,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array 0.4.15",
+]
+
+[[package]]
+name = "crypto_box"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16182b4f39a82ec8a6851155cc4c0cda3065bb1db33651726a29e1951de0f009"
+dependencies = [
+ "aead",
+ "crypto_secretbox",
+ "curve25519-dalek",
+ "salsa20",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "crypto_secretbox"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9d6cf87adf719ddf43a805e92c6870a531aedda35ff640442cbaf8674e141e1"
+dependencies = [
+ "aead",
+ "cipher 0.4.4",
+ "generic-array",
+ "poly1305",
+ "salsa20",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1997,6 +2027,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "salsa20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
+dependencies = [
+ "cipher 0.4.4",
 ]
 
 [[package]]

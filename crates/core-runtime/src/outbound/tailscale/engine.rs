@@ -19,15 +19,21 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio::sync::{mpsc, oneshot};
 
+use super::mesh::DirectMesh;
 use crate::inbound::Target;
 use crate::logging;
 use crate::outbound::tailscale::config::TailscaleConfig;
 use crate::outbound::tailscale::control::PeerObj;
 use crate::outbound::tailscale::derp::DerpMap;
+use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSock};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum Cmd {
+    UpdateLanApproval { approved: bool },
+    UpdateAccess {
+        rules: Vec<super::access::Rule>,
+    },
     TcpConnect {
         id: u32,
         dst: SocketAddr,
@@ -65,6 +71,9 @@ pub enum Cmd {
 pub struct TailscaleShared {
     pub cmd_tx: mpsc::Sender<Cmd>,
     pub next_id: AtomicU32,
+    pub local_ip: IpAddr,
+    pub control_connected: std::sync::atomic::AtomicBool,
+    pub routes_approved: std::sync::atomic::AtomicBool,
 }
 
 pub struct TailscaleDevice {
@@ -169,8 +178,20 @@ struct TcpConn {
 pub fn spawn_tailscale_engine(
     cfg: TailscaleConfig,
     local_ip: IpAddr,
-    mut cmd_rx: mpsc::Receiver<Cmd>,
+    cmd_rx: mpsc::Receiver<Cmd>,
 ) -> Arc<TailscaleShared> {
+    spawn_tailscale_engine_with_mesh(cfg, local_ip, cmd_rx, None)
+}
+
+pub fn spawn_tailscale_engine_with_mesh(
+    cfg: TailscaleConfig,
+    local_ip: IpAddr,
+    cmd_rx: mpsc::Receiver<Cmd>,
+    mesh: Option<DirectMesh>,
+) -> Arc<TailscaleShared> {
+    spawn_tailscale_engine_with_tun(cfg, local_ip, cmd_rx, mesh, None)
+}
+pub fn spawn_tailscale_engine_with_tun(cfg: TailscaleConfig, local_ip: IpAddr, mut cmd_rx: mpsc::Receiver<Cmd>, mut mesh: Option<DirectMesh>, tun: Option<super::lan::LanTun>) -> Arc<TailscaleShared> {
     let (cmd_tx, mut internal_cmd_rx) = mpsc::channel(128);
 
     // Forwarder from external commands to internal loop
@@ -184,12 +205,17 @@ pub fn spawn_tailscale_engine(
     });
 
     let shared = Arc::new(TailscaleShared {
+        local_ip,
+        control_connected: std::sync::atomic::AtomicBool::new(false),
+        routes_approved: std::sync::atomic::AtomicBool::new(false),
         cmd_tx,
         next_id: AtomicU32::new(1),
     });
 
     tokio::spawn(async move {
-        let mtu = cfg.system_interface_mtu.unwrap_or(1280) as usize;
+        let mtu = cfg.system_interface_mtu.unwrap_or(1280).min(1280) as usize;
+        let mut lan_rules = vec![];
+        let mut lan_approved = false;
         let mut device = TailscaleDevice::new(mtu);
 
         let local_cidr = match local_ip {
@@ -202,11 +228,31 @@ pub fn spawn_tailscale_engine(
         let mut iface = Interface::new(iface_cfg, &mut device, SmolInstant::now());
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(local_cidr);
+            if let Some(mesh) = &mesh {
+                for ip in mesh.local_ips() {
+                    if *ip != local_ip {
+                        let _ = addrs.push(IpCidr::new(
+                            IpAddress::from(*ip),
+                            if ip.is_ipv4() { 32 } else { 128 },
+                        ));
+                    }
+                }
+            }
         });
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(std::net::Ipv4Addr::UNSPECIFIED);
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv6_route(std::net::Ipv6Addr::UNSPECIFIED);
 
         let mut sockets = SocketSet::new(vec![]);
+        let mut web = cfg.luci_access.then(super::web::WebBridge::new);
         let mut tcp_conns: HashMap<u32, TcpConn> = HashMap::new();
-        let mut udp_sessions: HashMap<u16, mpsc::Sender<Vec<u8>>> = HashMap::new();
+        let mut udp_sessions: HashMap<
+            u16,
+            (SocketHandle, SocketAddr, mpsc::Sender<Vec<u8>>, Instant),
+        > = HashMap::new();
         let mut _peers: Vec<PeerObj> = Vec::new();
 
         let mut next_ephemeral_port: u16 = 40000;
@@ -218,6 +264,13 @@ pub fn spawn_tailscale_engine(
             // 1. Drain commands
             while let Ok(cmd) = internal_cmd_rx.try_recv() {
                 match cmd {
+                    Cmd::UpdateLanApproval { approved } => { lan_approved = approved; }
+                    Cmd::UpdateAccess { rules } => {
+                        lan_rules = rules.clone();
+                        if let Some(web) = &mut web {
+                            web.update_rules(rules);
+                        }
+                    }
                     Cmd::TcpConnect {
                         id,
                         dst,
@@ -278,7 +331,7 @@ pub fn spawn_tailscale_engine(
                             sockets.remove(conn.handle);
                         }
                     }
-                    Cmd::UdpOpen { target: _, resp } => {
+                    Cmd::UdpOpen { target, resp } => {
                         let local_port = next_ephemeral_port;
                         next_ephemeral_port = if next_ephemeral_port >= 65000 {
                             40000
@@ -286,20 +339,44 @@ pub fn spawn_tailscale_engine(
                             next_ephemeral_port + 1
                         };
                         let (tx, rx) = mpsc::channel(64);
-                        udp_sessions.insert(local_port, tx);
+                        let mut socket = UdpSock::new(
+                            PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0; 65536]),
+                            PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0; 65536]),
+                        );
+                        if socket.bind(local_port).is_err() {
+                            let _ = resp.send(Err("tailscale: UDP bind failed".into()));
+                            continue;
+                        }
+                        udp_sessions.insert(
+                            local_port,
+                            (sockets.add(socket), target, tx, Instant::now()),
+                        );
                         let _ = resp.send(Ok((local_port, rx)));
                     }
-                    Cmd::UdpSend { port: _, bytes: _ } => {
-                        // Forwarded via smoltcp virtual device or direct peer
+                    Cmd::UdpSend { port, bytes } => {
+                        if let Some((handle, target, _, activity)) = udp_sessions.get_mut(&port) {
+                            let _ = sockets
+                                .get_mut::<UdpSock>(*handle)
+                                .send_slice(&bytes, *target);
+                            *activity = Instant::now();
+                        }
                     }
                     Cmd::UdpClose { port } => {
-                        udp_sessions.remove(&port);
+                        if let Some((handle, _, _, _)) = udp_sessions.remove(&port) {
+                            sockets.remove(handle);
+                        }
                     }
                     Cmd::UpdatePeers {
                         peers: new_peers,
-                        derp_map: _,
+                        derp_map,
                     } => {
                         _peers = new_peers;
+                        if let Some(mesh) = &mut mesh {
+                            mesh.update_peers(&_peers);
+                            if let Some(map) = derp_map {
+                                mesh.update_relay_map(map);
+                            }
+                        }
                         logging::debug(format_args!(
                             "tailscale[{}]: updated peer table with {} nodes",
                             cfg.tag,
@@ -341,7 +418,23 @@ pub fn spawn_tailscale_engine(
                 }
             }
 
+            if let Some(mesh) = &mut mesh {
+                if let Ok(packets) = mesh.poll().await {
+                    for packet in packets {
+                        if let Some(tun) = &tun {
+                            if lan_approved && super::lan::permitted(&packet, &cfg.advertise_routes, &lan_rules) { let _ = tun.write(&packet); continue; }
+                        }
+                        if super::mesh::packet_ips(&packet).is_some_and(|(_, dst, _)| mesh.local_ips().contains(&dst)) { device.rx.push_back(packet); }
+                    }
+                }
+                if let Some(tun) = &tun {
+                    for _ in 0..64 { match tun.read() { Ok(Some(packet)) => { let _ = mesh.send(packet).await; }, _ => break } }
+                }
+            }
             // 3. Poll smoltcp stack
+            if let Some(web) = &mut web {
+                web.poll(&mut sockets);
+            }
             let _ = iface.poll(now, &mut device, &mut sockets);
 
             // 4. Pump TCP data from smoltcp sockets to callers
@@ -349,15 +442,16 @@ pub fn spawn_tailscale_engine(
             for (id, conn) in tcp_conns.iter_mut() {
                 let socket = sockets.get_mut::<TcpSock>(conn.handle);
                 while socket.can_recv() {
-                    let mut buf = vec![0u8; 8192];
-                    match socket.recv_slice(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            buf.truncate(n);
-                            if conn.to_caller.try_send(buf).is_err() {
-                                break;
-                            }
+                    let accepted = socket.recv(|data| {
+                        let size = data.len().min(8192);
+                        if conn.to_caller.try_send(data[..size].to_vec()).is_ok() {
+                            (size, true)
+                        } else {
+                            (0, false)
                         }
-                        _ => break,
+                    });
+                    if !matches!(accepted, Ok(true)) {
+                        break;
                     }
                 }
 
@@ -381,9 +475,36 @@ pub fn spawn_tailscale_engine(
                 }
             }
 
-            // 5. Drain packets emitted by smoltcp device (to be sent to WireGuard peers)
-            while let Some(_packet) = device.tx.pop_front() {
-                // In a live connection, packet is routed to peer matching destination IP
+            let mut expired = Vec::new();
+            for (port, (handle, target, replies, activity)) in &mut udp_sessions {
+                let socket = sockets.get_mut::<UdpSock>(*handle);
+                while let Ok((bytes, metadata)) = socket.recv() {
+                    if metadata.endpoint.addr == IpAddress::from(target.ip())
+                        && metadata.endpoint.port == target.port()
+                    {
+                        let _ = replies.try_send(bytes.to_vec());
+                        *activity = Instant::now();
+                    }
+                }
+                if replies.is_closed() || activity.elapsed() >= cfg.udp_timeout {
+                    expired.push(*port);
+                }
+            }
+            for port in expired {
+                if let Some((handle, _, _, _)) = udp_sessions.remove(&port) {
+                    sockets.remove(handle);
+                }
+            }
+
+            // Encrypt and send stack output through the mapped WireGuard peer.
+            while let Some(packet) = device.tx.pop_front() {
+                if let Some(mesh) = &mut mesh {
+                    let _ = mesh.send(packet).await;
+                }
+            }
+
+            if internal_cmd_rx.is_closed() && internal_cmd_rx.is_empty() {
+                break;
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -397,6 +518,157 @@ fn rand_seed() -> u64 {
     let mut b = [0u8; 8];
     getrandom::fill(&mut b).expect("getrandom seed");
     u64::from_le_bytes(b)
+}
+
+#[cfg(test)]
+mod mesh_tests {
+    use super::*;
+    use x25519_dalek::StaticSecret;
+
+    fn node(secret: &StaticSecret, ip: &str, port: u16) -> PeerObj {
+        PeerObj {
+            disco_key: None,
+            home_derp: None,
+            id: 1,
+            key: super::super::control::node_key_str(&x25519_dalek::PublicKey::from(secret)),
+            name: None,
+            addresses: vec![format!("{ip}/32")],
+            allowed_ips: vec![],
+            endpoints: Some(vec![format!("127.0.0.1:{port}")]),
+            derp: None,
+            online: Some(true),
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_and_udp_roundtrip_through_encrypted_mesh() {
+        let left_key = StaticSecret::from([3; 32]);
+        let right_key = StaticSecret::from([4; 32]);
+        let mut left = DirectMesh::bind(left_key.clone(), vec!["100.64.0.1".parse().unwrap()], 0)
+            .await
+            .unwrap();
+        let mut right = DirectMesh::bind(right_key.clone(), vec!["100.64.0.2".parse().unwrap()], 0)
+            .await
+            .unwrap();
+        left.update_peers(&[node(
+            &right_key,
+            "100.64.0.2",
+            right.local_addr().unwrap().port(),
+        )]);
+        right.update_peers(&[node(
+            &left_key,
+            "100.64.0.1",
+            left.local_addr().unwrap().port(),
+        )]);
+        let server = tokio::spawn(async move {
+            let mut device = TailscaleDevice::new(1280);
+            let mut iface = Interface::new(
+                IfaceConfig::new(HardwareAddress::Ip),
+                &mut device,
+                SmolInstant::now(),
+            );
+            iface.update_ip_addrs(|ips| {
+                ips.push("100.64.0.2/32".parse().unwrap()).unwrap();
+            });
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(std::net::Ipv4Addr::UNSPECIFIED)
+                .unwrap();
+            let mut sockets = SocketSet::new(vec![]);
+            let mut udp = UdpSock::new(
+                PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0; 65536]),
+                PacketBuffer::new(vec![PacketMetadata::EMPTY; 16], vec![0; 65536]),
+            );
+            udp.bind(1234).unwrap();
+            let udp_handle = sockets.add(udp);
+            let mut tcp = TcpSock::new(
+                TcpBuffer::new(vec![0; 65536]),
+                TcpBuffer::new(vec![0; 65536]),
+            );
+            tcp.listen(4321).unwrap();
+            let tcp_handle = sockets.add(tcp);
+            loop {
+                device.rx.extend(right.poll().await.unwrap());
+                iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+                let udp = sockets.get_mut::<UdpSock>(udp_handle);
+                if let Ok((bytes, metadata)) = udp.recv() {
+                    let bytes = bytes.to_vec();
+                    udp.send_slice(&bytes, metadata.endpoint).unwrap();
+                }
+                let tcp = sockets.get_mut::<TcpSock>(tcp_handle);
+                if tcp.can_recv() && tcp.can_send() {
+                    let mut bytes = [0; 1024];
+                    let n = tcp.recv_slice(&mut bytes).unwrap();
+                    tcp.send_slice(&bytes[..n]).unwrap();
+                }
+                while let Some(packet) = device.tx.pop_front() {
+                    right.send(packet).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        struct Abort(tokio::task::JoinHandle<()>);
+        impl Drop for Abort {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _server = Abort(server);
+        let config = serde_json::json!({"type":"tailscale", "tag":"test", "ephemeral":true});
+        let cfg = TailscaleConfig::parse(config.as_object().unwrap(), "test").unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let shared =
+            spawn_tailscale_engine_with_mesh(cfg, "100.64.0.1".parse().unwrap(), rx, Some(left));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (result, wait) = oneshot::channel();
+            shared
+                .cmd_tx
+                .send(Cmd::UdpOpen {
+                    target: "100.64.0.2:1234".parse().unwrap(),
+                    resp: result,
+                })
+                .await
+                .unwrap();
+            let (port, mut replies) = wait.await.unwrap().unwrap();
+            shared
+                .cmd_tx
+                .send(Cmd::UdpSend {
+                    port,
+                    bytes: b"UDP test".to_vec(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(replies.recv().await.unwrap(), b"UDP test");
+            shared.cmd_tx.send(Cmd::UdpClose { port }).await.unwrap();
+            let (result, wait) = oneshot::channel();
+            let (to_caller, mut data) = mpsc::channel(16);
+            shared
+                .cmd_tx
+                .send(Cmd::TcpConnect {
+                    id: 1,
+                    dst: "100.64.0.2:4321".parse().unwrap(),
+                    to_caller,
+                    resp: result,
+                })
+                .await
+                .unwrap();
+            wait.await.unwrap().unwrap();
+            shared
+                .cmd_tx
+                .send(Cmd::TcpData {
+                    id: 1,
+                    bytes: b"TCP test".to_vec(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(data.recv().await.unwrap(), b"TCP test");
+            shared.cmd_tx.send(Cmd::TcpClose { id: 1 }).await.unwrap();
+        })
+        .await
+        .unwrap();
+        drop(_tx);
+        drop(shared);
+    }
 }
 
 async fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {

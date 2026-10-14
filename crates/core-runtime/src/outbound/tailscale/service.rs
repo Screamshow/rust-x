@@ -1,0 +1,101 @@
+//! Experimental OpenWrt service using the native Rust X Tailscale implementation.
+//! Auth is read once from a root-only volatile file and never stored in config.
+use super::Tailscale;
+use std::{path::Path, time::Duration, sync::atomic::Ordering};
+const STATUS: &str = "/var/run/forkop/ui-state/tailscale-status.json";
+const AUTH: &str = "/var/run/forkop/ui-state/tailscale-auth";
+fn compatible() -> bool {
+    std::fs::read_to_string("/etc/forkop/sing-box-variant").is_ok_and(|v| v.trim() == "rust-x") &&
+        std::process::Command::new("/usr/lib/rust-x/sing-box").arg("tailscale-native-capability")
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success()) &&
+        std::process::Command::new("ucode").args(["/usr/lib/forkop/tailscale/compat.uc", "check"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+}
+fn cleanup_network() {
+    // Embedded: an old incoming Forkop package removes the newer helper files.
+    let script = r#"
+for chain in forward input; do
+ nft -a list chain inet fw4 "$chain" 2>/dev/null | sed -n '/comment "forkop-native-tailscale"/s/.*# handle \([0-9][0-9]*\).*/\1/p' | while read -r handle; do
+  nft delete rule inet fw4 "$chain" handle "$handle" 2>/dev/null || true
+ done
+done
+if [ -f /var/run/forkop/ui-state/tailscale-lan-owned ]; then
+ nft delete table inet forkop_native_tailscale 2>/dev/null || true
+ ip rule del priority 104 fwmark 0x880000/0xff0000 table 52743 2>/dev/null || true
+ ip route flush table 52743 2>/dev/null || true
+ rm -f /var/run/forkop/ui-state/tailscale-lan-owned
+fi
+"#;
+    let _ = std::process::Command::new("/bin/sh").args(["-c", script]).status();
+}
+fn status(value: serde_json::Value) -> std::io::Result<()> {
+    std::fs::write(format!("{STATUS}.new"), value.to_string())?;
+    std::fs::rename(format!("{STATUS}.new"), STATUS)
+}
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    if !compatible() { cleanup_network(); return Ok(()) }
+    let result = tokio::select! {
+        result = run_inner() => result,
+        _ = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if !compatible() { break }
+            }
+        } => {
+            cleanup_network();
+            let _ = status(serde_json::json!({"state":"disconnected", "message":"Требуются Forkop 2.3.4 или новее и совместимый Rust X"}));
+            let _ = std::process::Command::new("ubus").args(["call", "service", "delete", "{\"name\":\"forkop-tailscale\"}"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+            Ok(())
+        }
+    };
+    cleanup_network();
+    if result.is_err() { let _ = status(serde_json::json!({"state":"error", "message":"Не удалось запустить нативный Tailscale. Проверьте настройки Rust X."})); }
+    result
+}
+async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
+    status(serde_json::json!({"state":"connecting"}))?;
+    let auth = match std::fs::read_to_string(AUTH) {
+        Ok(value) => { std::fs::remove_file(AUTH)?; value.trim().to_owned() },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let mut config = serde_json::json!({"type":"tailscale", "tag":"luci",
+        "hostname":"forkop-router", "state_directory":"/etc/forkop-tailscale",
+        "listen_port":41642, "luci_access":true});
+    if !auth.is_empty() { config["auth_key"] = auth.into(); }
+    let lan_config: Option<serde_json::Value> = std::fs::read_to_string("/etc/forkop-tailscale/lan.json").ok().map(|s| serde_json::from_str(&s)).transpose()?;
+    if let Some(lan) = &lan_config {
+        config["system_interface"] = true.into();
+        config["advertise_routes"] = lan["routes"].clone();
+    }
+    let endpoint = Tailscale::build(config.as_object().unwrap(), "tailscale")?;
+    let mut delay = 2;
+    let shared = loop {
+        match endpoint.shared().await {
+            Ok(shared) => break shared,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    status(serde_json::json!({"state":"error", "message":"Ключ отклонён или требуется авторизация устройства в Tailscale."}))?;
+                    return Ok(());
+                }
+                status(serde_json::json!({"state":"reconnecting", "message":"Ожидаем доступ к интернету и серверу Tailscale…"}))?;
+                if !Path::new("/etc/forkop-tailscale/enabled").exists() { return Ok(()) }
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                delay = (delay * 2).min(30);
+            }
+        }
+    };
+    loop {
+        let lan_ready = if lan_config.is_some() {
+            std::process::Command::new("/usr/lib/forkop/tailscale/lan.sh").arg("setup").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok_and(|s| s.success())
+        } else { true };
+        status(serde_json::json!({"state":if shared.control_connected.load(Ordering::Relaxed) {"connected"} else {"reconnecting"}, "ip":shared.local_ip.to_string(),
+            "lan_ready":lan_ready, "routes_approved":shared.routes_approved.load(Ordering::Relaxed),
+            "message":if lan_ready {None} else {Some("Не удалось настроить передачу трафика в LAN")},
+            "updated_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()}))?;
+        // Service stop kills the process and closes every remote listener.
+        if !Path::new("/etc/forkop-tailscale/enabled").exists() { break; }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Ok(())
+}

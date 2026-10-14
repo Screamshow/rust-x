@@ -375,6 +375,7 @@ pub fn process_response(
 
 /// Result of successfully consuming a handshake initiation as responder.
 pub struct InitiationResult {
+    pub timestamp: [u8; 12],
     pub sender_index: u32,
     pub sender_static_pub: [u8; 32],
     pub e_pub: [u8; 32],
@@ -435,10 +436,12 @@ pub fn process_initiation(
     let (temp, ck3) = mix_key(&ck2, &dh(our_static_priv, &sender_static_pub));
     let key_ts = key2(&temp, &ck3);
     let enc_ts = &msg[88..116];
-    let _ts = aead_open(&key_ts, 0, enc_ts, &h).ok_or("initiation timestamp decrypt failed")?;
+    let ts = aead_open(&key_ts, 0, enc_ts, &h).ok_or("initiation timestamp decrypt failed")?;
+    let timestamp: [u8; 12] = ts.try_into().map_err(|_| "invalid initiation timestamp")?;
     h = hash_concat(&h, enc_ts);
 
     Ok(InitiationResult {
+        timestamp,
         sender_index,
         sender_static_pub,
         e_pub,
@@ -611,7 +614,7 @@ impl Session {
             return false;
         }
         let counter = u64::from_le_bytes(msg[8..16].try_into().unwrap());
-        if counter > REJECT_AFTER_MESSAGES || !self.accept_counter(counter) {
+        if counter > REJECT_AFTER_MESSAGES {
             return false;
         }
         let body = &msg[TRANSPORT_HEADER_LEN..];
@@ -622,9 +625,11 @@ impl Session {
         out.extend_from_slice(ciphertext);
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&counter.to_le_bytes());
-        self.recv_cipher
+        let authenticated = self
+            .recv_cipher
             .decrypt_in_place_detached(Nonce::from_slice(&nonce), &[], out, Tag::from_slice(tag))
-            .is_ok()
+            .is_ok();
+        authenticated && self.accept_counter(counter)
     }
 
     fn accept_counter(&mut self, counter: u64) -> bool {
@@ -1171,8 +1176,13 @@ mod tests {
         // Transport: initiator -> responder
         let plain_msg = b"hello from wireguard client";
         let sealed_by_init = init_session.seal(plain_msg).expect("init seal");
+        // Unauthenticated high counters must not poison the replay window.
+        let mut forged = sealed_by_init.clone();
+        forged[8..16].copy_from_slice(&1_000_000u64.to_le_bytes());
+        assert!(resp_session.open(&forged).is_none());
         let opened_by_resp = resp_session.open(&sealed_by_init).expect("resp open");
         assert_eq!(&opened_by_resp[..plain_msg.len()], plain_msg);
+        assert!(resp_session.open(&sealed_by_init).is_none());
 
         // Transport: responder -> initiator
         let reply_msg = b"hello from wireguard server";

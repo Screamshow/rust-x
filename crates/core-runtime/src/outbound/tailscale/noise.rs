@@ -15,11 +15,16 @@ const PROTOCOL_NAME: &[u8] = b"Noise_IK_25519_ChaChaPoly_BLAKE2s";
 pub struct CipherState {
     k: Option<[u8; 32]>,
     n: u64,
+    transport: bool,
 }
 
 impl CipherState {
     pub fn new(key: Option<[u8; 32]>) -> Self {
-        Self { k: key, n: 0 }
+        Self {
+            k: key,
+            n: 0,
+            transport: false,
+        }
     }
 
     pub fn has_key(&self) -> bool {
@@ -31,10 +36,20 @@ impl CipherState {
         self.n = 0;
     }
 
-    fn make_nonce(n: u64) -> Nonce {
+    pub fn into_transport(mut self) -> Self {
+        self.transport = true;
+        self
+    }
+
+    fn make_nonce(&self) -> Nonce {
         let mut nonce_bytes = [0u8; 12];
         // 4 bytes 0 + 8 bytes counter in little-endian (Noise spec)
-        nonce_bytes[4..].copy_from_slice(&n.to_le_bytes());
+        let counter = if self.transport {
+            self.n.to_be_bytes()
+        } else {
+            self.n.to_le_bytes()
+        };
+        nonce_bytes[4..].copy_from_slice(&counter);
         *Nonce::from_slice(&nonce_bytes)
     }
 
@@ -43,7 +58,7 @@ impl CipherState {
             return plaintext.to_vec();
         };
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        let nonce = Self::make_nonce(self.n);
+        let nonce = self.make_nonce();
         self.n = self.n.checked_add(1).expect("nonce overflow");
 
         let mut buffer = plaintext.to_vec();
@@ -62,7 +77,7 @@ impl CipherState {
             anyhow::bail!("ciphertext too short for auth tag");
         }
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
-        let nonce = Self::make_nonce(self.n);
+        let nonce = self.make_nonce();
         self.n = self.n.checked_add(1).expect("nonce overflow");
 
         let split_pos = ciphertext.len() - 16;
@@ -252,9 +267,15 @@ impl NoiseIkInitiator {
             .take()
             .ok_or_else(|| anyhow::anyhow!("missing ephemeral key"))?;
         let ee = e.diffie_hellman(&re_pub);
+        if !ee.was_contributory() {
+            anyhow::bail!("noise: invalid responder ephemeral key");
+        }
         self.sym.mix_key(ee.as_bytes());
 
         let se = self.s.diffie_hellman(&re_pub);
+        if !se.was_contributory() {
+            anyhow::bail!("noise: invalid responder ephemeral key");
+        }
         self.sym.mix_key(se.as_bytes());
 
         let payload = self.sym.decrypt_and_hash(&msg[32..])?;
@@ -334,6 +355,18 @@ impl NoiseIkResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_low_order_responder_ephemeral_key() {
+        let server = StaticSecret::from([2; 32]);
+        let mut client = NoiseIkInitiator::new(
+            StaticSecret::from([1; 32]),
+            PublicKey::from(&server),
+            b"test",
+        );
+        client.write_msg1(&[]);
+        assert!(client.read_msg2(&[0; 48]).is_err());
+    }
 
     #[test]
     fn test_noise_ik_handshake_roundtrip() {

@@ -15,6 +15,27 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 DEPENDENCIES = ['ca-bundle', 'kmod-tun']
 CONFLICTS = ['sing-box', 'sing-box-x', 'sing-box-tiny', 'sing-box-extended']
+NATIVE_STOP = b'''#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+[ ! -x /etc/init.d/forkop-tailscale ] || /etc/init.d/forkop-tailscale stop
+if [ -x /etc/init.d/forkop ] && /etc/init.d/forkop status >/dev/null 2>&1; then
+    mkdir -p /var/run/forkop
+    touch /var/run/forkop/rust-x-package-restart
+    /etc/init.d/forkop stop || exit 1
+fi
+exit 0
+'''
+NATIVE_START = b'''#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+if [ -f /var/run/forkop/rust-x-package-restart ] && [ -x /etc/init.d/forkop ]; then
+    /etc/init.d/forkop start && rm -f /var/run/forkop/rust-x-package-restart
+fi
+if [ -f /etc/forkop-tailscale/enabled ] && [ -x /etc/init.d/forkop-tailscale ] &&
+   [ "$(cat /etc/forkop/sing-box-variant 2>/dev/null)" = rust-x ]; then
+    /etc/init.d/forkop-tailscale start || true
+fi
+exit 0
+'''
 
 def tar_bytes(files):
     stream = io.BytesIO()
@@ -77,7 +98,7 @@ Description: Rust X router core for Forkop
 '''
         ipk = a.output/f'rust-x_{a.version}-{a.revision}_{arch}.ipk'
         ipk.write_bytes(tar_bytes([('debian-binary', b'2.0\n', 0o644),
-            ('control.tar.gz', tar_bytes([('control', control.encode(), 0o644), ('conffiles', b'/etc/config/sing-box\n', 0o644)]), 0o644),
+            ('control.tar.gz', tar_bytes([('control', control.encode(), 0o644), ('conffiles', b'/etc/config/sing-box\n', 0o644), ('prerm', NATIVE_STOP, 0o755), ('postinst', NATIVE_START, 0o755)]), 0o644),
             ('data.tar.gz', tar_bytes(files), 0o644)]))
         apk = a.output/f'rust-x_{a.version}-r{a.revision}_{arch}.apk'
         with tempfile.TemporaryDirectory(prefix='rust-x-package-') as temp:
@@ -93,6 +114,11 @@ Description: Rust X router core for Forkop
                 elif f.parent == meta: f.chmod(0o644)
                 os.utime(f, (0, 0))
             cmd = [a.apk_tool, 'mkpkg', '--files', str(payload), '--output', str(apk.resolve())]
+            for hook, content in [('pre-upgrade', NATIVE_STOP), ('pre-deinstall', NATIVE_STOP), ('post-upgrade', NATIVE_START), ('post-install', NATIVE_START)]:
+                script = Path(temp)/hook
+                script.write_bytes(content)
+                script.chmod(0o755)
+                cmd += ['-s', f'{hook}:{script}']
             fields = dict(name='rust-x', version=f'{a.version}-r{a.revision}', arch=arch,
                           description='Rust X router core for Forkop', license='GPL-3.0-only',
                           origin='rust-x', maintainer='Screamshow', url='https://github.com/Screamshow/rust-x',
