@@ -1247,10 +1247,9 @@ async fn exchange_doh(
     // TLS + h2 handshake per query burned the router's CPU and filled
     // TIME_WAIT against one DoH server until nothing resolved at all.
     if let Some((id, send)) = doh_h2_checkout(cfg, addr) {
-        match doh_h2_exchange(cfg, send, query).await {
+        match doh_h2_exchange_guarded(cfg, id, send, query).await {
             Ok(body) => return Ok(body),
             Err(e) => {
-                doh_h2_discard(cfg, id);
                 crate::logging::debug(format_args!(
                     "dns: DoH h2 connection for {:?} dropped after error: {e}",
                     cfg.tag
@@ -1282,6 +1281,7 @@ async fn exchange_doh(
                 send: send.clone(),
                 task,
             };
+            let id = conn.id;
             let send = send
                 .ready()
                 .await
@@ -1295,7 +1295,7 @@ async fn exchange_doh(
                     *pool = unused.take();
                 }
             }
-            doh_h2_exchange(cfg, send, query).await
+            doh_h2_exchange_guarded(cfg, id, send, query).await
         }
         _ => exchange_doh_h1(cfg, tls, query).await,
     }
@@ -1333,6 +1333,39 @@ fn doh_h2_discard(cfg: &ServerConfig, id: u64) {
     if pool.as_ref().is_some_and(|conn| conn.id == id) {
         *pool = None;
     }
+}
+
+/// A deadline drops the exchange future instead of returning through its error
+/// branch. Evict the connection on cancellation too, but never a replacement
+/// installed by another query. Successful requests leave the pool reusable.
+struct DohH2ExchangeGuard<'a> {
+    cfg: &'a ServerConfig,
+    id: u64,
+    completed: bool,
+}
+
+impl Drop for DohH2ExchangeGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            doh_h2_discard(self.cfg, self.id);
+        }
+    }
+}
+
+async fn doh_h2_exchange_guarded(
+    cfg: &ServerConfig,
+    id: u64,
+    send: h2::client::SendRequest<bytes::Bytes>,
+    query: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut guard = DohH2ExchangeGuard {
+        cfg,
+        id,
+        completed: false,
+    };
+    let result = doh_h2_exchange(cfg, send, query).await;
+    guard.completed = result.is_ok();
+    result
 }
 
 /// One DoH request/response stream over an h2 connection, pooled or fresh.
@@ -1691,6 +1724,77 @@ pub fn is_ip_literal(host: &str) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep a real HTTP/2 connection alive while deliberately withholding its
+    // response. Unlike an explicit transport error, deadline cancellation must
+    // evict the pool through Drop.
+    async fn stalled_doh_pool(cfg: &ServerConfig) -> tokio::task::JoinHandle<()> {
+        let (client, server) = tokio::io::duplex(65536);
+        let server = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server).await.unwrap();
+            let mut held = Vec::new();
+            while let Some(Ok((request, respond))) = conn.accept().await {
+                held.push((request, respond));
+            }
+        });
+        let (send, conn) = h2::client::handshake(client).await.unwrap();
+        *cfg.doh_h2.lock().unwrap() = Some(DohH2Conn {
+            id: DOH_H2_NEXT.fetch_add(1, Ordering::Relaxed),
+            addr: "127.0.0.1:443".parse().unwrap(),
+            send,
+            task: tokio::spawn(async move {
+                let _ = conn.await;
+            }),
+        });
+        server
+    }
+
+    #[tokio::test]
+    async fn doh_h2_timeout_evicts_stalled_connection() {
+        let mut cfg = ServerConfig::build(
+            &serde_json::json!({"type":"https", "server":"127.0.0.1"}),
+            "dns.servers[0]",
+        )
+        .unwrap();
+        cfg.timeout = Duration::from_millis(100);
+        let server = stalled_doh_pool(&cfg).await;
+        let query =
+            crate::dns::codec::build_query(1, "stalled.test", hickory_proto::rr::RecordType::A)
+                .unwrap();
+        let error = exchange(
+            &cfg,
+            "127.0.0.1:443".parse().unwrap(),
+            &query,
+            &Dialer::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timeout"), "{error}");
+        assert!(cfg.doh_h2.lock().unwrap().is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn doh_h2_cancelled_query_preserves_replacement_connection() {
+        let cfg = ServerConfig::build(
+            &serde_json::json!({"type":"https", "server":"127.0.0.1"}),
+            "dns.servers[0]",
+        )
+        .unwrap();
+        let old_server = stalled_doh_pool(&cfg).await;
+        let old_id = cfg.doh_h2.lock().unwrap().as_ref().unwrap().id;
+        let guard = DohH2ExchangeGuard {
+            cfg: &cfg,
+            id: old_id,
+            completed: false,
+        };
+        let new_server = stalled_doh_pool(&cfg).await;
+        let new_id = cfg.doh_h2.lock().unwrap().as_ref().unwrap().id;
+        drop(guard);
+        assert_eq!(cfg.doh_h2.lock().unwrap().as_ref().unwrap().id, new_id);
+        old_server.abort();
+        new_server.abort();
+    }
 
     #[test]
     fn prefix_parse_and_contains() {

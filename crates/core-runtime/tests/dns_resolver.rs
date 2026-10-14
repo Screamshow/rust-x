@@ -269,6 +269,13 @@ async fn spawn_doh_h2_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
 }
 
 async fn spawn_doh_h2_dns_counted(answer_ip: Ipv4Addr) -> (SocketAddr, Hits, Hits) {
+    spawn_doh_h2_dns_stalling(answer_ip, None).await
+}
+
+async fn spawn_doh_h2_dns_stalling(
+    answer_ip: Ipv4Addr,
+    stall_first_connection_after: Option<usize>,
+) -> (SocketAddr, Hits, Hits) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind doh");
     let addr = listener.local_addr().expect("doh addr");
     let hits = Arc::new(AtomicUsize::new(0));
@@ -282,7 +289,7 @@ async fn spawn_doh_h2_dns_counted(answer_ip: Ipv4Addr) -> (SocketAddr, Hits, Hit
             let Ok((tcp, _)) = listener.accept().await else {
                 return;
             };
-            accepted_count.fetch_add(1, Ordering::SeqCst);
+            let connection_number = accepted_count.fetch_add(1, Ordering::SeqCst) + 1;
             let hits = Arc::clone(&hits2);
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
@@ -293,6 +300,7 @@ async fn spawn_doh_h2_dns_counted(answer_ip: Ipv4Addr) -> (SocketAddr, Hits, Hit
                     return;
                 };
                 eprintln!("[doh-debug] server h2 up");
+                let queries = Arc::new(AtomicUsize::new(0));
                 while let Some(accepted) = conn.accept().await {
                     let Ok((request, mut respond)) = accepted else {
                         return;
@@ -301,6 +309,7 @@ async fn spawn_doh_h2_dns_counted(answer_ip: Ipv4Addr) -> (SocketAddr, Hits, Hit
                     // request body is read — handle each request in its own
                     // task so `accept()` stays live.
                     let hits = Arc::clone(&hits);
+                    let queries = Arc::clone(&queries);
                     tokio::spawn(async move {
                         let mut body = request.into_parts().1;
                         let mut query_raw = Vec::new();
@@ -313,6 +322,13 @@ async fn spawn_doh_h2_dns_counted(answer_ip: Ipv4Addr) -> (SocketAddr, Hits, Hit
                             return;
                         };
                         hits.fetch_add(1, Ordering::SeqCst);
+                        let query_number = queries.fetch_add(1, Ordering::SeqCst);
+                        if connection_number == 1
+                            && stall_first_connection_after.is_some_and(|n| query_number >= n)
+                        {
+                            let _ = std::future::poll_fn(|cx| respond.poll_reset(cx)).await;
+                            return;
+                        }
                         let resp = build_answer(&query, answer_ip);
                         let head = http::Response::builder()
                             .status(200)
@@ -952,4 +968,45 @@ async fn doh_reuses_connection_and_separates_same_tag_configurations() {
         vec![ip(10, 0, 0, 4)]
     );
     assert_eq!(other_connections.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn doh_timeout_recovers_without_reload_on_fresh_and_reused_connections() {
+    for warmup in [false, true] {
+        let (addr, hits, connections) =
+            spawn_doh_h2_dns_stalling(Ipv4Addr::new(10, 0, 0, 3), Some(usize::from(warmup))).await;
+        let svc = service(&json!({"dns": {
+            "servers": [{"type":"https", "tag":"doh", "server":"127.0.0.1",
+                "server_port":addr.port(),
+                "tls":{"enabled":true,"server_name":"localhost","insecure":true}}],
+            "final":"doh", "disable_cache":true
+        }}));
+        if warmup {
+            exchange_ok(&svc, &query("warmup.test", "A")).await;
+        }
+        let error = tokio::time::timeout(
+            Duration::from_secs(7),
+            svc.exchange(&QueryMeta::default(), &query("stalled.test", "A"), true),
+        )
+        .await
+        .expect("core deadline must fire")
+        .unwrap_err();
+        assert!(error.to_string().contains("timeout"), "{error}");
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        for name in ["recovered.test", "still-reused.test"] {
+            let answer = tokio::time::timeout(
+                Duration::from_secs(3),
+                svc.exchange(&QueryMeta::default(), &query(name, "A"), true),
+            )
+            .await
+            .expect("replacement connection must answer promptly")
+            .unwrap();
+            assert_eq!(
+                core_runtime::dns::codec::answer_ips(&answer).unwrap(),
+                vec![ip(10, 0, 0, 3)]
+            );
+        }
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 3 + usize::from(warmup));
+    }
 }
