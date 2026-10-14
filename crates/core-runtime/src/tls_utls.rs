@@ -45,6 +45,8 @@ pub struct FingerprintStream<S> {
     wbuf: Vec<u8>,
     /// how far into `wbuf` the socket has taken; `None` between records
     out: Option<usize>,
+    /// Plaintext length of the sealed record, independent of later input growth.
+    pending_plaintext: usize,
     eof: bool,
     direct_read: bool,
 }
@@ -62,6 +64,7 @@ impl<S> FingerprintStream<S> {
             record_end: 0,
             wbuf: Vec::new(),
             out: None,
+            pending_plaintext: 0,
             eof: false,
             direct_read: false,
         }
@@ -81,6 +84,20 @@ impl<S> FingerprintStream<S> {
 
     pub(crate) fn enable_direct_read(&mut self) {
         self.direct_read = true;
+        self.release_direct_read_buffer();
+    }
+
+    fn release_direct_read_buffer(&mut self) {
+        if self.direct_read && self.plain_at == self.plain_end {
+            release_drained_raw(&mut self.raw, &mut self.rpos);
+        }
+    }
+}
+
+fn release_drained_raw(raw: &mut Vec<u8>, rpos: &mut usize) {
+    if *rpos == raw.len() {
+        *raw = Vec::new();
+        *rpos = 0;
     }
 }
 
@@ -104,6 +121,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
                     me.plain_at = 0;
                     me.plain_end = 0;
                     me.record_end = 0;
+                    me.release_direct_read_buffer();
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -114,8 +132,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
                 if take > 0 {
                     buf.put_slice(&me.raw[me.rpos..me.rpos + take]);
                     me.rpos += take;
+                    me.release_direct_read_buffer();
                     return Poll::Ready(Ok(()));
                 }
+                me.release_direct_read_buffer();
                 return Pin::new(&mut me.inner).poll_read(cx, buf);
             }
             if me.eof || me.connection.is_closed() {
@@ -208,6 +228,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
                     return Poll::Ready(Err(e));
                 }
                 me.out = Some(0);
+                me.pending_plaintext = take;
                 continue;
             };
             match Pin::new(&mut me.inner).poll_write(cx, &me.wbuf[pos..]) {
@@ -215,7 +236,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
                     let pos = pos + n;
                     if pos == me.wbuf.len() {
                         me.out = None;
-                        return Poll::Ready(Ok(take));
+                        let written = std::mem::take(&mut me.pending_plaintext);
+                        return Poll::Ready(Ok(written));
                     }
                     me.out = Some(pos);
                 }
@@ -242,3 +264,155 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
 /// syscalls: 2^14 of plaintext, a type byte, a 16-byte tag, a 5-byte header.
 /// A compile-time check, because a runtime one would only ever be a comment.
 const _: () = assert!(CHUNK > 16384 + 1 + 16 + 5);
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    struct PauseWriteOnce {
+        inner: tokio::io::DuplexStream,
+        pause: bool,
+    }
+
+    impl AsyncRead for PauseWriteOnce {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for PauseWriteOnce {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pause {
+                self.pause = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_read_preserves_pending_plaintext_and_tail_without_disabling_tls_write() {
+        use core_tls::client::{Config, Handshake};
+        use core_tls::rustls::{RootCertStore, ServerConfig};
+        use core_tls::verify::WebpkiVerifier;
+        use std::sync::Arc;
+
+        core_tls::install_default_provider();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
+        let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.crt")).unwrap(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.key")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(certs[0].clone()).unwrap();
+        let verifier = WebpkiVerifier::new(Arc::new(roots)).unwrap();
+        let template = core_tls::fingerprints::by_name("chrome").unwrap();
+        let (mut client, peer) = tokio::io::duplex(CHUNK);
+        let server = tokio::spawn(async move {
+            let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+                .accept(peer)
+                .await
+                .unwrap();
+            let mut request = [0; 2];
+            tls.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"hi");
+        });
+        let mut handshake = Handshake::new(Config {
+            template: &template,
+            server_name: "localhost",
+            alpn: &[],
+            verifier: &verifier,
+            reality: None,
+            fragment: false,
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        handshake.run(&mut client).await.unwrap();
+        let connection = Connection::new(&mut handshake).unwrap();
+        let mut stream = FingerprintStream::new(
+            PauseWriteOnce {
+                inner: client,
+                pause: true,
+            },
+            connection,
+        );
+        // State at the transition: decrypted plaintext followed by raw peer bytes.
+        stream.raw = Vec::with_capacity(CHUNK);
+        stream.raw.extend_from_slice(b"plainRAW");
+        stream.plain_at = 0;
+        stream.plain_end = 5;
+        stream.record_end = 5;
+        stream.enable_direct_read();
+        assert_eq!(stream.raw.capacity(), CHUNK);
+        let mut plaintext = [0; 5];
+        stream.read_exact(&mut plaintext).await.unwrap();
+        assert_eq!(&plaintext, b"plain");
+        assert_eq!(stream.raw.capacity(), CHUNK);
+        let mut tail = [0; 3];
+        stream.read_exact(&mut tail).await.unwrap();
+        assert_eq!(&tail, b"RAW");
+        assert_eq!(stream.raw.capacity(), 0);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            Pin::new(&mut stream)
+                .poll_write(&mut cx, b"hi")
+                .is_pending()
+        );
+        // The relay may append input while its writer is pending. Only the
+        // original record's plaintext was consumed, even if this slice grew.
+        let written = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, b"hiEXTRA"))
+            .await
+            .unwrap();
+        assert_eq!(
+            written, 2,
+            "must report the pending record's original length"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn direct_read_keeps_unread_tail_and_releases_only_when_drained() {
+        let mut raw = Vec::with_capacity(CHUNK);
+        raw.extend_from_slice(b"encryptedraw tail");
+        let mut rpos = 9;
+        release_drained_raw(&mut raw, &mut rpos);
+        assert_eq!(&raw[rpos..], b"raw tail");
+        assert_eq!(raw.capacity(), CHUNK);
+        rpos += 3;
+        release_drained_raw(&mut raw, &mut rpos);
+        assert_eq!(&raw[rpos..], b" tail");
+        rpos = raw.len();
+        release_drained_raw(&mut raw, &mut rpos);
+        assert_eq!(raw.capacity(), 0);
+        assert_eq!(rpos, 0);
+        release_drained_raw(&mut raw, &mut rpos);
+        assert_eq!(raw.capacity(), 0);
+    }
+}

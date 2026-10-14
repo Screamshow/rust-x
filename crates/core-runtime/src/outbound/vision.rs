@@ -273,7 +273,27 @@ impl AsyncRead for VisionStream {
                 let take = this.payload.len().min(out.remaining());
                 out.put_slice(&this.payload[..take]);
                 let _ = this.payload.split_to(take);
+                if this.payload.is_empty()
+                    && this.raw.is_empty()
+                    && this.current_command != PADDING_CONTINUE
+                    && this.remaining_content == 0
+                    && this.remaining_padding == 0
+                {
+                    this.raw = BytesMut::new();
+                    this.payload = BytesMut::new();
+                }
                 return std::task::Poll::Ready(Ok(()));
+            }
+            if this.current_command != PADDING_CONTINUE
+                && this.remaining_content == 0
+                && this.remaining_padding == 0
+                && this.raw.is_empty()
+            {
+                // Framing ended and its last payload was delivered. Subsequent
+                // bytes belong to the inner stream; retain neither staging buffer.
+                this.raw = BytesMut::new();
+                this.payload = BytesMut::new();
+                return std::pin::Pin::new(&mut this.inner).poll_read(cx, out);
             }
             if this.eof {
                 return std::task::Poll::Ready(Ok(()));
@@ -332,6 +352,9 @@ impl AsyncWrite for VisionStream {
                         this.framed_at += n;
                         if this.framed_at == this.framed.len() {
                             this.framed.clear();
+                            if !this.padding {
+                                this.framed = Vec::new();
+                            }
                             this.framed_at = 0;
                             let done = this.pending;
                             this.pending = 0;
@@ -637,6 +660,27 @@ mod tests {
         sink.unpad();
         assert_eq!(&sink.payload[..], &b"firstsecond"[..]);
         assert!(sink.raw.is_empty(), "the framing is fully consumed");
+    }
+
+    #[tokio::test]
+    async fn ended_framing_drains_tail_then_releases_staging_buffers() {
+        let (client, mut peer) = tokio::io::duplex(1 << 18);
+        let mut stream = VisionStream::new(Box::new(client), uuid());
+        let mut wire = wire_frame(true, PADDING_END, b"last", 3);
+        wire.extend_from_slice(b"tail");
+        peer.write_all(&wire).await.unwrap();
+        let mut first = [0; 8];
+        stream.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"lasttail");
+        assert_eq!(stream.raw.capacity(), 0);
+        assert_eq!(stream.payload.capacity(), 0);
+        let payload = vec![0x5a; 65536];
+        peer.write_all(&payload).await.unwrap();
+        let mut received = vec![0; payload.len()];
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload);
+        assert_eq!(stream.raw.capacity(), 0);
+        assert_eq!(stream.payload.capacity(), 0);
     }
 
     #[test]
