@@ -392,20 +392,44 @@ fn set_bytes(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &[u8]) -> 
 }
 
 #[cfg(unix)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn new_socket(addr: &SocketAddr, udp: bool) -> io::Result<RawFd> {
     let domain = if addr.is_ipv6() {
         libc::AF_INET6
     } else {
         libc::AF_INET
     };
+    #[cfg(target_os = "linux")]
+    let socket_type = if udp {
+        libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC
+    } else {
+        libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC
+    };
+    #[cfg(not(target_os = "linux"))]
+    let socket_type = if udp {
+        libc::SOCK_DGRAM
+    } else {
+        libc::SOCK_STREAM
+    };
+
     let fd = unsafe {
         libc::socket(
             domain,
-            if udp {
-                libc::SOCK_DGRAM
-            } else {
-                libc::SOCK_STREAM
-            },
+            socket_type,
             if udp {
                 libc::IPPROTO_UDP
             } else {
@@ -415,6 +439,11 @@ fn new_socket(addr: &SocketAddr, udp: bool) -> io::Result<RawFd> {
     };
     if fd < 0 {
         return Err(io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    if let Err(err) = set_fd_nonblocking(fd) {
+        unsafe { libc::close(fd) };
+        return Err(err);
     }
     Ok(fd)
 }
@@ -752,8 +781,11 @@ where
 /// No `setsockopt` to reach for here: `parse` already refused the options this
 /// platform cannot carry, so the socket is the plain one.
 #[cfg(not(unix))]
-async fn dial_tcp(addr: SocketAddr, _options: &DialOptions) -> io::Result<TcpStream> {
-    TcpStream::connect(addr).await
+async fn dial_tcp(addr: SocketAddr, options: &DialOptions) -> io::Result<TcpStream> {
+    match tokio::time::timeout(options.connect_timeout(), TcpStream::connect(addr)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout")),
+    }
 }
 
 #[cfg(not(unix))]
@@ -768,55 +800,96 @@ pub async fn connect_udp(addr: SocketAddr, _options: &DialOptions) -> io::Result
 }
 
 #[cfg(unix)]
+fn build_tcp_stream(addr: &SocketAddr, options: &DialOptions) -> io::Result<std::net::TcpStream> {
+    let fd = new_socket(addr, false)?;
+    if let Err(err) = options.apply(fd, addr, false) {
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    if let Some(local) = options.bind_address(addr)
+        && let Err(err) = bind_local(fd, &local)
+    {
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    // the socket goes back non-blocking with the handshake already started:
+    // `connect` on a non-blocking socket returns EINPROGRESS, and the reactor
+    // reports it finished in `finish_connect`. That is what makes the connect
+    // cancellable, which a blocking `connect` in here is not.
+    match connect_socket(fd, addr) {
+        Ok(()) => {}
+        // EINPROGRESS is `ErrorKind::InProgress` on Linux and
+        // `WouldBlock` elsewhere, so the errno is what we compare
+        Err(err)
+            if matches!(
+                err.raw_os_error(),
+                Some(code) if code == libc::EINPROGRESS || code == libc::EAGAIN || code == libc::EWOULDBLOCK
+            ) => {}
+        Err(err) => {
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+    }
+    if let Some(path) = &options.protect_path
+        && let Err(err) = crate::protect::protect(path, fd)
+    {
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    // SAFETY: the socket is a fresh, owned fd
+    let stream = unsafe { <std::net::TcpStream as FromRawFd>::from_raw_fd(fd) };
+    stream.set_nonblocking(true)?;
+    Ok(stream)
+}
+
+#[cfg(unix)]
 async fn dial_tcp(addr: SocketAddr, options: &DialOptions) -> io::Result<TcpStream> {
-    let options = options.clone();
     let timeout = options.connect_timeout();
-    let netns = options.netns.clone();
-    let protect = options.protect_path.clone();
-    let std = tokio::task::spawn_blocking(move || -> io::Result<std::net::TcpStream> {
-        let socket = move |addr: &SocketAddr| -> io::Result<std::net::TcpStream> {
-            let fd = new_socket(addr, false)?;
-            if let Err(err) = options.apply(fd, addr, false) {
-                unsafe { libc::close(fd) };
-                return Err(err);
-            }
-            if let Some(local) = options.bind_address(addr)
-                && let Err(err) = bind_local(fd, &local)
-            {
-                unsafe { libc::close(fd) };
-                return Err(err);
-            }
-            // the socket goes back non-blocking with the handshake already started:
-            // `connect` on a non-blocking socket returns EINPROGRESS, and the reactor
-            // reports it finished in `finish_connect`. That is what makes the connect
-            // cancellable, which a blocking `connect` in here is not.
-            match connect_socket(fd, addr) {
-                Ok(()) => {}
-                // EINPROGRESS is `ErrorKind::InProgress` on Linux and
-                // `WouldBlock` elsewhere, so the errno is what we compare
-                Err(err)
-                    if matches!(
-                        err.raw_os_error(),
-                        Some(code) if code == libc::EINPROGRESS || code == libc::EAGAIN
-                    ) => {}
-                Err(err) => {
-                    unsafe { libc::close(fd) };
-                    return Err(err);
-                }
-            }
-            if let Some(path) = &protect {
-                crate::protect::protect(path, fd)?;
-            }
-            // SAFETY: the socket is a fresh, owned fd
-            let stream = unsafe { <std::net::TcpStream as FromRawFd>::from_raw_fd(fd) };
-            stream.set_nonblocking(true)?;
-            Ok(stream)
-        };
-        in_netns(&netns, move || socket(&addr))
-    })
-    .await
-    .map_err(io::Error::other)??;
+    let std = if options.netns.is_some() {
+        let options = options.clone();
+        let netns = options.netns.clone();
+        tokio::task::spawn_blocking(move || {
+            in_netns(&netns, move || build_tcp_stream(&addr, &options))
+        })
+        .await
+        .map_err(io::Error::other)??
+    } else {
+        build_tcp_stream(&addr, options)?
+    };
     finish_connect(std, timeout).await
+}
+
+#[cfg(unix)]
+fn build_udp_socket(addr: &SocketAddr, options: &DialOptions) -> io::Result<std::net::UdpSocket> {
+    let fd = new_socket(addr, true)?;
+    let finish = |fd| -> io::Result<std::net::UdpSocket> {
+        // SAFETY: the socket is a fresh, connected, owned fd
+        let socket = unsafe { <std::net::UdpSocket as FromRawFd>::from_raw_fd(fd) };
+        socket.set_nonblocking(true)?;
+        Ok(socket)
+    };
+    if let Err(err) = options.apply(fd, addr, true) {
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    if let Some(local) = options.bind_address(addr) {
+        // no port to speak of yet: the local address, any port
+        if let Err(err) = bind_local(fd, &local) {
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+    }
+    if let Err(err) = connect_socket(fd, addr) {
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    if let Some(path) = &options.protect_path
+        && let Err(err) = crate::protect::protect(path, fd)
+    {
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    finish(fd)
 }
 
 #[cfg(unix)]
@@ -830,42 +903,17 @@ pub async fn connect_udp(addr: SocketAddr, options: &DialOptions) -> io::Result<
         socket.connect(addr).await?;
         return Ok(socket);
     }
-    let options = options.clone();
-    let netns = options.netns.clone();
-    let protect = options.protect_path.clone();
-    let std = tokio::task::spawn_blocking(move || -> io::Result<std::net::UdpSocket> {
-        let socket = move || -> io::Result<std::net::UdpSocket> {
-            let fd = new_socket(&addr, true)?;
-            let finish = |fd| -> io::Result<std::net::UdpSocket> {
-                // SAFETY: the socket is a fresh, connected, owned fd
-                let socket = unsafe { <std::net::UdpSocket as FromRawFd>::from_raw_fd(fd) };
-                socket.set_nonblocking(true)?;
-                Ok(socket)
-            };
-            if let Err(err) = options.apply(fd, &addr, true) {
-                unsafe { libc::close(fd) };
-                return Err(err);
-            }
-            if let Some(local) = options.bind_address(&addr) {
-                // no port to speak of yet: the local address, any port
-                if let Err(err) = bind_local(fd, &local) {
-                    unsafe { libc::close(fd) };
-                    return Err(err);
-                }
-            }
-            if let Err(err) = connect_socket(fd, &addr) {
-                unsafe { libc::close(fd) };
-                return Err(err);
-            }
-            if let Some(path) = &protect {
-                crate::protect::protect(path, fd)?;
-            }
-            finish(fd)
-        };
-        in_netns(&netns, socket)
-    })
-    .await
-    .map_err(io::Error::other)??;
+    let std = if options.netns.is_some() {
+        let options = options.clone();
+        let netns = options.netns.clone();
+        tokio::task::spawn_blocking(move || {
+            in_netns(&netns, move || build_udp_socket(&addr, &options))
+        })
+        .await
+        .map_err(io::Error::other)??
+    } else {
+        build_udp_socket(&addr, options)?
+    };
     UdpSocket::from_std(std)
 }
 
@@ -1466,5 +1514,39 @@ mod tests {
             options.bind_address(&external_addr),
             Some("192.168.1.1:0".parse().unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn dial_timeout_does_not_block_runtime() {
+        // TEST-NET-2 is reserved for documentation. A local route may reject it
+        // immediately; this checks bounded completion, not guaranteed blackholing.
+        let addr: SocketAddr = "198.51.100.1:12345".parse().unwrap();
+        let options = DialOptions {
+            connect_timeout: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let result = connect_tcp_addr(addr, &options).await;
+        assert!(result.is_err(), "expected error for unreachable IP");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "connect must time out asynchronously without blocking runtime, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_sockets_start_nonblocking_and_close_on_exec() {
+        let addr = "127.0.0.1:9".parse().unwrap();
+        for udp in [false, true] {
+            let fd = new_socket(&addr, udp).unwrap();
+            let socket = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(status & libc::O_NONBLOCK, 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            drop(socket);
+        }
     }
 }

@@ -82,6 +82,22 @@ impl H2Stream {
         Self::build(response, send, None)
     }
 
+    /// Write-only stream borrow for XHTTP `stream-up` over HTTP/2, where the
+    /// response status and body are watched by a separate ack task.
+    pub(crate) fn upload_only(send: h2::SendStream<Bytes>) -> Self {
+        Self {
+            send: Some(send),
+            response: None,
+            recv: None,
+            pending: VecDeque::new(),
+            pending_len: 0,
+            out: Bytes::new(),
+            report: 0,
+            eof: true,
+            conn_task: None,
+        }
+    }
+
     /// The same, for a caller that has already read the head -- naive does, so
     /// that a refused CONNECT is reported as itself rather than as a stream that
     /// happens to be closed. The body is left live even if the head came with an

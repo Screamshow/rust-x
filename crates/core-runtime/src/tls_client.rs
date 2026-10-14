@@ -207,6 +207,11 @@ impl TlsOptions {
         &self.server_name
     }
 
+    /// Configured ALPN protocol list (empty when unset).
+    pub fn alpn(&self) -> &[Vec<u8>] {
+        &self.alpn
+    }
+
     /// Parse outbound `tls` options; `None` when TLS is absent or disabled.
     pub fn from_outbound(
         obj: &serde_json::Map<String, Value>,
@@ -470,6 +475,8 @@ impl TlsOptions {
         for cert in &self.ca_certs {
             cert.as_ref().hash(&mut ca);
         }
+        self.certificate_sha256.hash(&mut ca);
+        self.certificate_public_key_sha256.hash(&mut ca);
         let key = (
             self.min_tls13,
             self.max_tls12,
@@ -504,6 +511,20 @@ impl TlsOptions {
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAny))
+                .with_no_client_auth()
+        } else if !self.certificate_sha256.is_empty()
+            || !self.certificate_public_key_sha256.is_empty()
+        {
+            let inner =
+                core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?.into_inner();
+            let verifier = core_tls::verify::PinVerifier::new(
+                inner,
+                self.certificate_sha256.clone(),
+                self.certificate_public_key_sha256.clone(),
+            );
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth()
         } else {
             builder
@@ -551,6 +572,20 @@ impl TlsOptions {
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAny))
+                .with_no_client_auth()
+        } else if !self.certificate_sha256.is_empty()
+            || !self.certificate_public_key_sha256.is_empty()
+        {
+            let inner =
+                core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?.into_inner();
+            let verifier = core_tls::verify::PinVerifier::new(
+                inner,
+                self.certificate_sha256.clone(),
+                self.certificate_public_key_sha256.clone(),
+            );
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth()
         } else {
             builder
@@ -879,6 +914,87 @@ mod tests {
     }
 
     #[test]
+    fn tls_cache_separates_certificate_and_public_key_pin_policies() {
+        let mut tls = options(json!({"tls": {"enabled": true}})).unwrap().unwrap();
+        let cache = new_tls_config_cache();
+        let versions = &[&rustls::version::TLS13];
+        let plain = tls.client_config_cached(versions, &[], &cache).unwrap();
+        tls.certificate_sha256 = vec![[1; 32]];
+        let pinned = tls.client_config_cached(versions, &[], &cache).unwrap();
+        assert!(!Arc::ptr_eq(&plain, &pinned));
+        tls.certificate_sha256 = vec![[2; 32]];
+        let changed = tls.client_config_cached(versions, &[], &cache).unwrap();
+        assert!(!Arc::ptr_eq(&pinned, &changed));
+        tls.certificate_public_key_sha256 = vec![[3; 32]];
+        let public = tls.client_config_cached(versions, &[], &cache).unwrap();
+        assert!(!Arc::ptr_eq(&changed, &public));
+        assert!(Arc::ptr_eq(
+            &public,
+            &tls.client_config_cached(versions, &[], &cache).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_tls_requires_matching_pins_in_addition_to_the_ca() {
+        use sha2::Digest;
+        use tokio::net::TcpListener;
+        let cert = rustls_pemfile::certs(
+            &mut include_bytes!("../../../tests/golden/certs/urltest-valid.crt").as_slice(),
+        )
+        .next()
+        .unwrap()
+        .unwrap();
+        let ca = rustls_pemfile::certs(
+            &mut include_bytes!("../../../tests/golden/certs/urltest-ca.crt").as_slice(),
+        )
+        .next()
+        .unwrap()
+        .unwrap();
+        let cert_pin: [u8; 32] = sha2::Sha256::digest(cert.as_ref()).into();
+        let key_pin = core_tls::verify::spki_sha256(cert.as_ref()).unwrap();
+        for (cert_pins, key_pins, insecure, expected) in [
+            (vec![], vec![], false, true),
+            (vec![cert_pin], vec![key_pin], false, true),
+            (vec![[0; 32]], vec![], false, false),
+            (vec![], vec![[0; 32]], false, false),
+            (vec![[0; 32]], vec![[0; 32]], true, true),
+        ] {
+            let key = rustls_pemfile::private_key(
+                &mut include_bytes!("../../../tests/golden/certs/localhost.key").as_slice(),
+            )
+            .unwrap()
+            .unwrap();
+            let cfg =
+                rustls::ServerConfig::builder_with_provider(Arc::new(core_crypto::provider()))
+                    .with_protocol_versions(&[&rustls::version::TLS13])
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![cert.clone()], key)
+                    .unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let _ = acceptor.accept(socket).await;
+            });
+            let mut tls = options(json!({"tls":{"enabled":true,"server_name":"localhost"}}))
+                .unwrap()
+                .unwrap();
+            tls.ca_certs = vec![ca.clone()];
+            tls.certificate_sha256 = cert_pins;
+            tls.certificate_public_key_sha256 = key_pins;
+            tls.insecure = insecure;
+            let socket = TcpStream::connect(addr).await.unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), tls.wrap(socket))
+                .await
+                .unwrap();
+            assert_eq!(result.is_ok(), expected, "TLS pin policy");
+            task.abort();
+        }
+    }
+
+    #[test]
     fn tls_config_cache_evicts_old_entries_without_invalidating_live_configs() {
         let tls = options(json!({"tls": {"enabled": true}})).unwrap().unwrap();
         let cache = new_tls_config_cache();
@@ -905,6 +1021,92 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &rebuilt));
         assert_eq!(rebuilt.alpn_protocols, first.alpn_protocols);
         assert_eq!(cache.lock().unwrap().len(), TLS_CONFIG_CACHE_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn quic_requires_matching_certificate_and_public_key_pins() {
+        use sha2::Digest;
+        let cert = rustls_pemfile::certs(
+            &mut include_bytes!("../../../tests/golden/certs/urltest-valid.crt").as_slice(),
+        )
+        .next()
+        .unwrap()
+        .unwrap();
+        let ca = rustls_pemfile::certs(
+            &mut include_bytes!("../../../tests/golden/certs/urltest-ca.crt").as_slice(),
+        )
+        .next()
+        .unwrap()
+        .unwrap();
+        let cert_pin: [u8; 32] = sha2::Sha256::digest(cert.as_ref()).into();
+        let key_pin = core_tls::verify::spki_sha256(cert.as_ref()).unwrap();
+        let key = rustls_pemfile::private_key(
+            &mut include_bytes!("../../../tests/golden/certs/localhost.key").as_slice(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut cfg =
+            rustls::ServerConfig::builder_with_provider(core_tls::quic::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .unwrap();
+        cfg.alpn_protocols = vec![b"pin-test".to_vec()];
+        let server_config = quinn::ServerConfig::new(
+            Arc::new(core_tls::quic::QuicServerConfig::try_from(cfg).unwrap()),
+            Arc::new(core_tls::quic::HandshakeTokenKeyRustCrypto::new([7; 64])),
+        );
+        let endpoint_config =
+            || quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(&[9; 32])));
+        let server = quinn::Endpoint::new(
+            endpoint_config(),
+            Some(server_config),
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            quinn::default_runtime().unwrap(),
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(connection) = incoming.await {
+                        connection.closed().await;
+                    }
+                });
+            }
+        });
+        for (cert_pins, key_pins, expected) in [
+            (vec![cert_pin], vec![key_pin], true),
+            (vec![[0; 32]], vec![], false),
+            (vec![], vec![[0; 32]], false),
+        ] {
+            let mut tls = options(json!({"tls":{"enabled":true,"server_name":"localhost"}}))
+                .unwrap()
+                .unwrap();
+            tls.ca_certs = vec![ca.clone()];
+            tls.certificate_sha256 = cert_pins;
+            tls.certificate_public_key_sha256 = key_pins;
+            let mut client = quinn::Endpoint::new(
+                endpoint_config(),
+                None,
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                quinn::default_runtime().unwrap(),
+            )
+            .unwrap();
+            client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+                tls.quic_config(&[b"pin-test"]).unwrap(),
+            )));
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.connect(addr, "localhost").unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), expected, "QUIC pin policy");
+            client.close(0u32.into(), b"test complete");
+        }
+        server_task.abort();
     }
 
     /// The whole point of the change: a fingerprint in the config is a table we

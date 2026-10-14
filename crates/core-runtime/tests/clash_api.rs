@@ -96,6 +96,51 @@ fn anonymous(path: &str) -> String {
 }
 
 #[tokio::test]
+async fn encoded_slash_names_support_lookup_selection_and_delay() {
+    let config = serde_json::json!({
+        "log":{"level":"error"},
+        "experimental":{"clash_api":{"external_controller":"127.0.0.1:0","secret":SECRET}},
+        "inbounds":[{"type":"mixed","tag":"in","listen":"127.0.0.1","listen_port":0}],
+        "outbounds":[
+            {"type":"direct","tag":"node/A"},
+            {"type":"direct","tag":"node/B"},
+            {"type":"selector","tag":"Group/A","outbounds":["node/A","node/B"]}
+        ],
+        "route":{"final":"Group/A"}
+    });
+    let instance = core_runtime::start(&config).await.unwrap();
+    let addr = instance.clash_api_addr().unwrap();
+    assert_eq!(
+        request(addr, &authed("/proxies/node%2FA")).await.status,
+        200
+    );
+    assert_eq!(
+        request(addr, &authed("/proxies/Group%2FA")).await.json()["now"],
+        "node/A"
+    );
+    let body = r#"{"name":"node/B"}"#;
+    let put = format!(
+        "PUT /proxies/Group%2FA HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {SECRET}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    assert_eq!(request(addr, &put).await.status, 204);
+    assert_eq!(
+        request(addr, &authed("/proxies/Group%2FA")).await.json()["now"],
+        "node/B"
+    );
+    for path in ["/proxies/node%2FA/delay", "/group/Group%2FA/delay"] {
+        let url = format!("{path}?url=http%3A%2F%2F127.0.0.1%3A1&timeout=100");
+        let response = request(addr, &authed(&url)).await;
+        assert_eq!(
+            response.status, 503,
+            "encoded name must reach the delay handler and report the refused target"
+        );
+        assert!(response.json().get("message").is_some());
+    }
+    instance.shutdown();
+}
+
+#[tokio::test]
 async fn clash_api_rest_surface() {
     let config = serde_json::json!({
         "log": {"level": "error"},
