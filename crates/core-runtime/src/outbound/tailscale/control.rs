@@ -15,6 +15,14 @@ use crate::outbound::tailscale::derp::DerpMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Hostinfo {
+    #[serde(rename = "IPNVersion", default)]
+    pub ipn_version: String,
+    #[serde(rename = "OSVersion", default)]
+    pub os_version: String,
+    #[serde(rename = "Distro", default)]
+    pub distro: String,
+    #[serde(rename = "DistroVersion", default)]
+    pub distro_version: String,
     #[serde(rename = "OS", default = "default_os")]
     pub os: String,
     #[serde(rename = "Hostname", default)]
@@ -23,8 +31,91 @@ pub struct Hostinfo {
     pub routable_ips: Vec<String>,
 }
 
+impl Hostinfo {
+    /// The numeric prefix is our control-protocol compatibility baseline, not
+    /// an assertion that this independent client contains the upstream daemon.
+    pub fn new(hostname: &str, routes: &[String]) -> Self {
+        Self::from_release(
+            hostname,
+            routes,
+            &fs::read_to_string("/etc/os-release").unwrap_or_default(),
+            &fs::read_to_string("/etc/openwrt_release").unwrap_or_default(),
+            &fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default(),
+        )
+    }
+
+    fn from_release(
+        hostname: &str,
+        routes: &[String],
+        os: &str,
+        openwrt: &str,
+        kernel: &str,
+    ) -> Self {
+        fn field(text: &str, key: &str) -> String {
+            text.lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once('=')?;
+                    (name.trim() == key).then(|| value.trim().trim_matches(['\'', '"']).to_owned())
+                })
+                .unwrap_or_default()
+        }
+        let mut distro = field(os, "ID");
+        let mut distro_version = field(os, "VERSION_ID");
+        if !openwrt.is_empty() {
+            distro = "openwrt".into();
+            let version = field(openwrt, "DISTRIB_RELEASE");
+            if !version.is_empty() {
+                distro_version = version;
+            }
+        }
+        // Keep the OS family stable for existing node identities. The hosted
+        // control plane withheld addresses when Linux was changed to OpenWrt.
+        // Its machine list ignores Distro, so include the release in the
+        // displayed version as well as the proper distribution fields.
+        let os_version = if distro == "openwrt" {
+            format!("OpenWrt {distro_version}")
+        } else {
+            kernel.trim().into()
+        };
+        Self {
+            ipn_version: concat!("1.80.0-rustx", env!("CARGO_PKG_VERSION")).into(),
+            os: std::env::consts::OS.into(),
+            os_version,
+            distro,
+            distro_version,
+            hostname: hostname.into(),
+            routable_ips: routes.to_vec(),
+        }
+    }
+}
+
 fn default_os() -> String {
     "linux".to_string()
+}
+
+#[cfg(test)]
+mod hostinfo_tests {
+    use super::*;
+    #[test]
+    fn openwrt_hostinfo_preserves_os_family_and_reports_release() {
+        let info = Hostinfo::from_release(
+            "router",
+            &["192.168.1.0/24".into()],
+            "ID=openwrt\nVERSION_ID=25.12.5\n",
+            "DISTRIB_RELEASE='25.12.5'\n",
+            "6.12.94\n",
+        );
+        let value = serde_json::to_value(info).unwrap();
+        assert_eq!(value["Distro"], "openwrt");
+        assert_eq!(value["DistroVersion"], "25.12.5");
+        assert_eq!(value["OS"], std::env::consts::OS);
+        assert_eq!(value["OSVersion"], "OpenWrt 25.12.5");
+        assert_eq!(
+            value["IPNVersion"],
+            concat!("1.80.0-rustx", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(value["RoutableIPs"][0], "192.168.1.0/24");
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -65,14 +156,22 @@ pub struct NodeObj {
     pub id: u64,
     #[serde(rename = "Key")]
     pub key: String,
-    #[serde(rename = "Addresses", default)]
+    #[serde(rename = "Addresses", default, deserialize_with = "null_default")]
     pub addresses: Vec<String>,
-    #[serde(rename = "AllowedIPs", default)]
+    #[serde(rename = "AllowedIPs", default, deserialize_with = "null_default")]
     pub allowed_ips: Vec<String>,
-    #[serde(rename = "Endpoints", default)]
+    #[serde(rename = "Endpoints", default, deserialize_with = "null_default")]
     pub endpoints: Vec<String>,
     #[serde(rename = "DERP", default)]
     pub derp: Option<Value>,
+}
+
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

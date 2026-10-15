@@ -43,6 +43,47 @@ const REPLY_QUEUE: usize = 32;
 const SCRATCH_BUF: usize = 16_384;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn assigned_addresses(node: &control::NodeObj) -> io::Result<Vec<IpAddr>> {
+    let mut addresses = node
+        .addresses
+        .iter()
+        .map(|address| {
+            let cidr = address.parse::<smoltcp::wire::IpCidr>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tailscale: invalid assigned address",
+                )
+            })?;
+            let ip: IpAddr = cidr.address().into();
+            if cidr.prefix_len() != if ip.is_ipv4() { 32 } else { 128 }
+                || ip.is_unspecified()
+                || ip.is_multicast()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tailscale: invalid assigned address",
+                ));
+            }
+            Ok(ip)
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    addresses.sort();
+    addresses.dedup();
+    if addresses.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "tailscale: server returned no assigned address",
+        ));
+    }
+    if addresses.len() > 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tailscale: missing or excessive assigned addresses",
+        ));
+    }
+    Ok(addresses)
+}
+
 /// Tailscale endpoint outbound.
 #[derive(Clone)]
 pub struct Tailscale {
@@ -111,20 +152,15 @@ impl Tailscale {
                             auth_key: key.clone(),
                         }
                     }),
-                    hostinfo: Hostinfo {
-                        os: "linux".to_owned(),
-                        hostname: self
-                            .cfg
-                            .hostname
-                            .clone()
-                            .unwrap_or_else(|| "rust-x".to_owned()),
-                        routable_ips: self
+                    hostinfo: Hostinfo::new(
+                        self.cfg.hostname.as_deref().unwrap_or("rust-x"),
+                        &self
                             .cfg
                             .advertise_routes
                             .iter()
                             .map(ToString::to_string)
-                            .collect(),
-                    },
+                            .collect::<Vec<_>>(),
+                    ),
                     ephemeral: self.cfg.ephemeral,
                     followup: followup.map(ToString::to_string),
                 })
@@ -154,24 +190,13 @@ impl Tailscale {
                 "tailscale: authorization required; retrieve AuthURL through register()",
             ));
         }
-        let local_vip = response
-            .node
-            .as_ref()
-            .and_then(|node| {
-                node.addresses
-                    .iter()
-                    .find_map(|address| address.split('/').next()?.parse::<IpAddr>().ok())
-            })
-            .ok_or_else(|| io::Error::other("tailscale: registration has no assigned address"))?;
+        let local_ips =
+            assigned_addresses(response.node.as_ref().ok_or_else(|| {
+                io::Error::other("tailscale: registration has no assigned address")
+            })?)?;
+        let local_vip = local_ips[0];
+        let mut expected_addresses = local_ips.clone();
         let (_cmd_tx, cmd_rx) = mpsc::channel(128);
-        let local_ips = response
-            .node
-            .as_ref()
-            .unwrap()
-            .addresses
-            .iter()
-            .filter_map(|a| a.split('/').next()?.parse::<IpAddr>().ok())
-            .collect();
         let mut mesh =
             mesh::DirectMesh::bind(node_key.clone(), local_ips, self.cfg.listen_port).await?;
         let mut home = None;
@@ -209,7 +234,6 @@ impl Tailscale {
         let weak = Arc::downgrade(&shared);
         let cfg = self.cfg.clone();
         let node = node_key_str(&x25519_dalek::PublicKey::from(&node_key));
-        let expected_addresses = response.node.as_ref().unwrap().addresses.clone();
         tokio::spawn(async move {
             let mut session = None;
             let mut delay = 1;
@@ -295,10 +319,34 @@ impl Tailscale {
                         {
                             break;
                         }
-                        // Changing local identity/address requires a fresh endpoint,
-                        // never continue accepting traffic with stale local addresses.
+                        // A map may reassign our IP while retaining the node key.
+                        // Wait for the data plane to apply it before reporting ready.
                         if let Some(local) = &map.node {
-                            addresses_valid = local.addresses == expected_addresses;
+                            let next = assigned_addresses(local);
+                            addresses_valid = false;
+                            if let Ok(next) = next {
+                                if next != expected_addresses {
+                                    shared.control_connected.store(false, Ordering::Relaxed);
+                                    let (resp, wait) = oneshot::channel();
+                                    if shared
+                                        .cmd_tx
+                                        .send(Cmd::UpdateLocalAddresses {
+                                            addresses: next.clone(),
+                                            resp,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    if matches!(wait.await, Ok(Ok(()))) {
+                                        expected_addresses = next;
+                                        addresses_valid = true;
+                                    }
+                                } else {
+                                    addresses_valid = true;
+                                }
+                            }
                             shared.routes_approved.store(
                                 !cfg.advertise_routes.is_empty()
                                     && cfg.advertise_routes.iter().all(|route| {
@@ -529,6 +577,40 @@ impl Tailscale {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assigned_addresses_normalize_order_and_reject_subnets() {
+        let node = |addresses: serde_json::Value| {
+            serde_json::from_value::<control::NodeObj>(
+                serde_json::json!({"ID":1,"Key":"nodekey:test","Addresses":addresses}),
+            )
+            .unwrap()
+        };
+        let a = node(serde_json::json!([
+            "fd7a:115c:a1e0::1/128",
+            "100.64.0.1/32"
+        ]));
+        let b = node(serde_json::json!([
+            "100.64.0.1/32",
+            "fd7a:115c:a1e0::1/128"
+        ]));
+        assert_eq!(
+            assigned_addresses(&a).unwrap(),
+            assigned_addresses(&b).unwrap()
+        );
+        let unavailable = node(serde_json::Value::Null);
+        assert_eq!(
+            assigned_addresses(&unavailable).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        for addresses in [
+            serde_json::json!([]),
+            serde_json::json!(["100.64.0.0/24"]),
+            serde_json::json!(["bad"]),
+        ] {
+            assert!(assigned_addresses(&node(addresses)).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn test_tailscale_build_and_engine_start() {

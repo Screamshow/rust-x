@@ -4,6 +4,32 @@ use super::Tailscale;
 use std::{path::Path, sync::atomic::Ordering, time::Duration};
 const STATUS: &str = "/var/run/forkop/ui-state/tailscale-status.json";
 const AUTH: &str = "/var/run/forkop/ui-state/tailscale-auth";
+fn safe_failure_reason(error: &std::io::Error) -> String {
+    let reason = error.to_string();
+    // Only fixed local protocol diagnostics may enter UI status. Never echo
+    // arbitrary transport/server errors, which can contain credentials.
+    if matches!(
+        reason.as_str(),
+        "tailscale: invalid control key response"
+            | "tailscale: missing Noise public key"
+            | "tailscale: zero control key"
+            | "tailscale: control upgrade refused"
+            | "tailscale: invalid upgrade response"
+            | "tailscale: invalid Noise handshake response"
+            | "tailscale: invalid Noise record"
+            | "tailscale: invalid registration response"
+            | "tailscale: truncated map header"
+            | "tailscale: invalid map frame length"
+            | "tailscale: invalid map response"
+            | "tailscale: invalid assigned address"
+            | "tailscale: missing or excessive assigned addresses"
+            | "tailscale: registration has no assigned address"
+    ) {
+        reason
+    } else {
+        format!("{:?}", error.kind())
+    }
+}
 fn compatible() -> bool {
     std::fs::read_to_string("/etc/forkop/sing-box-variant").is_ok_and(|v| v.trim() == "rust-x")
         && std::process::Command::new("/usr/lib/rust-x/sing-box")
@@ -104,13 +130,17 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             Ok(shared) => break shared,
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    status(
-                        serde_json::json!({"state":"error", "message":"Ключ отклонён или требуется авторизация устройства в Tailscale."}),
-                    )?;
+                    status(serde_json::json!({"state":"error", "message":
+                    if error.to_string() == "tailscale: server returned no assigned address" {
+                        "Сервер Tailscale не назначил адрес устройству. Проверьте авторизацию и совместимость клиента."
+                    } else {
+                        "Ключ отклонён или требуется авторизация устройства в Tailscale."
+                    }}))?;
                     return Ok(());
                 }
                 status(
-                    serde_json::json!({"state":"reconnecting", "message":"Ожидаем доступ к интернету и серверу Tailscale…"}),
+                    serde_json::json!({"state":"reconnecting", "message":"Ожидаем доступ к интернету и серверу Tailscale…",
+                        "error_kind":format!("{:?}", error.kind()), "error_reason":safe_failure_reason(&error), "retry_in_seconds":delay}),
                 )?;
                 if !Path::new("/etc/forkop-tailscale/enabled").exists() {
                     return Ok(());
@@ -132,7 +162,7 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             true
         };
         status(
-            serde_json::json!({"state":if shared.control_connected.load(Ordering::Relaxed) {"connected"} else {"reconnecting"}, "ip":shared.local_ip.to_string(),
+            serde_json::json!({"state":if shared.control_connected.load(Ordering::Relaxed) {"connected"} else {"reconnecting"}, "ip":shared.local_ip().to_string(),
             "lan_ready":lan_ready, "routes_approved":shared.routes_approved.load(Ordering::Relaxed),
             "message":if lan_ready {None} else {Some("Не удалось настроить передачу трафика в LAN")},
             "updated_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()}),
@@ -144,4 +174,22 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn retry_status_does_not_echo_server_or_transport_secrets() {
+        let secret_error = std::io::Error::other("server echoed tskey-auth-test-secret");
+        assert_eq!(safe_failure_reason(&secret_error), "Other");
+        let local = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "tailscale: invalid map response",
+        );
+        assert_eq!(
+            safe_failure_reason(&local),
+            "tailscale: invalid map response"
+        );
+    }
 }

@@ -30,6 +30,10 @@ use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSock};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum Cmd {
+    UpdateLocalAddresses {
+        addresses: Vec<IpAddr>,
+        resp: oneshot::Sender<io::Result<()>>,
+    },
     UpdateLanApproval {
         approved: bool,
     },
@@ -73,9 +77,15 @@ pub enum Cmd {
 pub struct TailscaleShared {
     pub cmd_tx: mpsc::Sender<Cmd>,
     pub next_id: AtomicU32,
-    pub local_ip: IpAddr,
+    local_ip: std::sync::RwLock<IpAddr>,
     pub control_connected: std::sync::atomic::AtomicBool,
     pub routes_approved: std::sync::atomic::AtomicBool,
+}
+
+impl TailscaleShared {
+    pub fn local_ip(&self) -> IpAddr {
+        *self.local_ip.read().unwrap()
+    }
 }
 
 pub struct TailscaleDevice {
@@ -213,13 +223,14 @@ pub fn spawn_tailscale_engine_with_tun(
     });
 
     let shared = Arc::new(TailscaleShared {
-        local_ip,
+        local_ip: std::sync::RwLock::new(local_ip),
         control_connected: std::sync::atomic::AtomicBool::new(false),
         routes_approved: std::sync::atomic::AtomicBool::new(false),
         cmd_tx,
         next_id: AtomicU32::new(1),
     });
 
+    let weak = Arc::downgrade(&shared);
     tokio::spawn(async move {
         let mtu = cfg.system_interface_mtu.unwrap_or(1280).min(1280) as usize;
         let mut lan_rules = vec![];
@@ -272,6 +283,49 @@ pub fn spawn_tailscale_engine_with_tun(
             // 1. Drain commands
             while let Ok(cmd) = internal_cmd_rx.try_recv() {
                 match cmd {
+                    Cmd::UpdateLocalAddresses { addresses, resp } => {
+                        if addresses.is_empty()
+                            || addresses.len() > 2
+                            || addresses
+                                .iter()
+                                .any(|ip| ip.is_unspecified() || ip.is_multicast())
+                        {
+                            let _ = resp.send(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "tailscale: invalid assigned addresses",
+                            )));
+                            continue;
+                        }
+                        // Existing sessions belong to the old local address. Drop
+                        // them before permitting any packets for the new identity.
+                        tcp_conns.clear();
+                        udp_sessions.clear();
+                        web = cfg.luci_access.then(|| {
+                            let mut bridge = super::web::WebBridge::new(cfg.ssh_access);
+                            bridge.update_rules(lan_rules.clone());
+                            bridge
+                        });
+                        sockets = SocketSet::new(vec![]);
+                        device.rx.clear();
+                        device.tx.clear();
+                        iface.update_ip_addrs(|ips| {
+                            ips.clear();
+                            for ip in &addresses {
+                                ips.push(IpCidr::new(
+                                    (*ip).into(),
+                                    if ip.is_ipv4() { 32 } else { 128 },
+                                ))
+                                .unwrap();
+                            }
+                        });
+                        if let Some(mesh) = &mut mesh {
+                            mesh.set_local_ips(addresses.clone());
+                        }
+                        if let Some(shared) = weak.upgrade() {
+                            *shared.local_ip.write().unwrap() = addresses[0];
+                        }
+                        let _ = resp.send(Ok(()));
+                    }
                     Cmd::UpdateLanApproval { approved } => {
                         lan_approved = approved;
                     }
@@ -582,6 +636,15 @@ mod mesh_tests {
 
     #[tokio::test]
     async fn tcp_and_udp_roundtrip_through_encrypted_mesh() {
+        mesh_roundtrip(false).await;
+    }
+
+    #[tokio::test]
+    async fn reassigned_local_ip_restores_encrypted_tcp_and_udp() {
+        mesh_roundtrip(true).await;
+    }
+
+    async fn mesh_roundtrip(reassign: bool) {
         let left_key = StaticSecret::from([3; 32]);
         let right_key = StaticSecret::from([4; 32]);
         let mut left = DirectMesh::bind(left_key.clone(), vec!["100.64.0.1".parse().unwrap()], 0)
@@ -600,6 +663,8 @@ mod mesh_tests {
             "100.64.0.1",
             left.local_addr().unwrap().port(),
         )]);
+        let left_port = left.local_addr().unwrap().port();
+        let (changes, mut changed) = mpsc::channel::<(String, oneshot::Sender<()>)>(1);
         let server = tokio::spawn(async move {
             let mut device = TailscaleDevice::new(1280);
             let mut iface = Interface::new(
@@ -628,6 +693,13 @@ mod mesh_tests {
             tcp.listen(4321).unwrap();
             let tcp_handle = sockets.add(tcp);
             loop {
+                if let Ok((address, done)) = changed.try_recv() {
+                    right.update_peers(&[node(&left_key, &address, left_port)]);
+                    let tcp = sockets.get_mut::<TcpSock>(tcp_handle);
+                    tcp.abort();
+                    tcp.listen(4321).unwrap();
+                    let _ = done.send(());
+                }
                 device.rx.extend(right.poll().await.unwrap());
                 iface.poll(SmolInstant::now(), &mut device, &mut sockets);
                 let udp = sockets.get_mut::<UdpSock>(udp_handle);
@@ -659,53 +731,76 @@ mod mesh_tests {
         let (_tx, rx) = mpsc::channel(1);
         let shared =
             spawn_tailscale_engine_with_mesh(cfg, "100.64.0.1".parse().unwrap(), rx, Some(left));
-        tokio::time::timeout(Duration::from_secs(3), async {
-            let (result, wait) = oneshot::channel();
-            shared
-                .cmd_tx
-                .send(Cmd::UdpOpen {
-                    target: "100.64.0.2:1234".parse().unwrap(),
-                    resp: result,
-                })
-                .await
-                .unwrap();
-            let (port, mut replies) = wait.await.unwrap().unwrap();
-            shared
-                .cmd_tx
-                .send(Cmd::UdpSend {
-                    port,
-                    bytes: b"UDP test".to_vec(),
-                })
-                .await
-                .unwrap();
-            assert_eq!(replies.recv().await.unwrap(), b"UDP test");
-            shared.cmd_tx.send(Cmd::UdpClose { port }).await.unwrap();
-            let (result, wait) = oneshot::channel();
-            let (to_caller, mut data) = mpsc::channel(16);
-            shared
-                .cmd_tx
-                .send(Cmd::TcpConnect {
-                    id: 1,
-                    dst: "100.64.0.2:4321".parse().unwrap(),
-                    to_caller,
-                    resp: result,
-                })
-                .await
-                .unwrap();
-            wait.await.unwrap().unwrap();
-            shared
-                .cmd_tx
-                .send(Cmd::TcpData {
-                    id: 1,
-                    bytes: b"TCP test".to_vec(),
-                })
-                .await
-                .unwrap();
-            assert_eq!(data.recv().await.unwrap(), b"TCP test");
-            shared.cmd_tx.send(Cmd::TcpClose { id: 1 }).await.unwrap();
-        })
-        .await
-        .unwrap();
+        let addresses = if reassign {
+            vec!["100.64.0.1", "100.64.0.3", "100.64.0.1"]
+        } else {
+            vec!["100.64.0.1"]
+        };
+        for (i, address) in addresses.into_iter().enumerate() {
+            if i > 0 {
+                let (done, wait) = oneshot::channel();
+                changes.send((address.into(), done)).await.unwrap();
+                wait.await.unwrap();
+                let (resp, wait) = oneshot::channel();
+                shared
+                    .cmd_tx
+                    .send(Cmd::UpdateLocalAddresses {
+                        addresses: vec![address.parse().unwrap()],
+                        resp,
+                    })
+                    .await
+                    .unwrap();
+                wait.await.unwrap().unwrap();
+                assert_eq!(shared.local_ip(), address.parse::<IpAddr>().unwrap());
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let (result, wait) = oneshot::channel();
+                shared
+                    .cmd_tx
+                    .send(Cmd::UdpOpen {
+                        target: "100.64.0.2:1234".parse().unwrap(),
+                        resp: result,
+                    })
+                    .await
+                    .unwrap();
+                let (port, mut replies) = wait.await.unwrap().unwrap();
+                shared
+                    .cmd_tx
+                    .send(Cmd::UdpSend {
+                        port,
+                        bytes: b"UDP test".to_vec(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(replies.recv().await.unwrap(), b"UDP test");
+                shared.cmd_tx.send(Cmd::UdpClose { port }).await.unwrap();
+                let (result, wait) = oneshot::channel();
+                let (to_caller, mut data) = mpsc::channel(16);
+                shared
+                    .cmd_tx
+                    .send(Cmd::TcpConnect {
+                        id: 1,
+                        dst: "100.64.0.2:4321".parse().unwrap(),
+                        to_caller,
+                        resp: result,
+                    })
+                    .await
+                    .unwrap();
+                wait.await.unwrap().unwrap();
+                shared
+                    .cmd_tx
+                    .send(Cmd::TcpData {
+                        id: 1,
+                        bytes: b"TCP test".to_vec(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(data.recv().await.unwrap(), b"TCP test");
+                shared.cmd_tx.send(Cmd::TcpClose { id: 1 }).await.unwrap();
+            })
+            .await
+            .unwrap();
+        }
         drop(_tx);
         drop(shared);
     }

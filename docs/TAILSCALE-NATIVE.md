@@ -193,8 +193,12 @@ requests and stops when its owner disappears.
 Every successful snapshot replaces the peer set; removed peers lose their
 WireGuard state. A failed request clears all peers until a new snapshot succeeds.
 The request itself can take up to 30 seconds before that failure is detected.
-If the local assigned address changes, peers remain empty until the endpoint is
-reinitialized. DERP catalog updates cancel connections whose server definitions
+If the local assigned addresses change, the engine replaces its userspace IP
+addresses and mesh destination checks, drops sessions using the previous IP,
+and recreates LuCI/SSH listeners with the current access rules. Status reports
+the new address only after the engine acknowledges the change. Address ordering
+alone does not reset sessions. Invalid assigned addresses fail closed.
+DERP catalog updates cancel connections whose server definitions
 changed or vanished and permit fresh connections using the new definitions.
 
 27 focused musl tests passed locally, including an HTTP/2 test verifying the
@@ -290,3 +294,13 @@ restarted and hosts restored byte-for-byte afterward. Forkop UCI SHA-256 remaine
 `aeb9e1e593c3cd6d46c79e7759a65fa459305e397b3ba797b91ecb936f1b5468`.
 Temporary test client credentials and executables were removed after testing;
 the native node identity in /tmp/rust-x-ts-native-state remains for further tests.
+
+## Native client metadata and local IP reassignment
+
+Hostinfo is consistent across registration, initial map, announcement and streaming requests. IPNVersion carries a numeric interoperability baseline plus the explicit rustx suffix and actual Rust X build version; it does not identify this independent implementation as the official Tailscale daemon. The negotiated capability level remains separate.
+
+For OpenWrt, preserve the linux OS family of existing node identities. Set distribution/release fields from os-release/openwrt_release and include OpenWrt with its release in the displayed OSVersion. The hosted console ignored the proper distribution fields alone. Changing OS to OpenWrt/openwrt on the existing test identity resulted in no assigned addresses, including after reauthorization; do not silently perform that identity change in an upgrade.
+
+A health map may legitimately contain Node.Addresses=null. Parse nullable node arrays as empty and report that the server did not assign an address rather than treating the response as a malformed map and indefinitely waiting for internet connectivity. Diagnostic status exposes only fixed local error reasons. On a map parsing failure, a root-only volatile type/structure snapshot omits string values.
+
+Actual address changes update the userspace interface and mesh destination checks, close old sessions, and recreate incoming listeners with current access rules. Address ordering is normalized. Live x86_64 VM testing verified hosted-console IPv4 change and reversal with LuCI access and unchanged identity, followed by a real reboot. This does not establish all upstream Tailscale features or approved-LAN forwarding compatibility.

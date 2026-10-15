@@ -79,6 +79,12 @@ impl DirectMesh {
     pub fn local_ips(&self) -> &[IpAddr] {
         &self.local
     }
+    pub fn set_local_ips(&mut self, addresses: Vec<IpAddr>) {
+        self.local = addresses;
+        for peer in self.peers.values_mut() {
+            peer.pending.clear();
+        }
+    }
     pub fn disco_public(&self) -> [u8; 32] {
         PublicKey::from(&self.disco).to_bytes()
     }

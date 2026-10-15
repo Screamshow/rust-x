@@ -12,6 +12,14 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 pub const CAPABILITY_VERSION: u32 = 111;
 const LIMIT: usize = 1024 * 1024;
+fn map_hostinfo(hostname: &str, routes: &[String], home: Option<u16>) -> serde_json::Value {
+    let mut info = serde_json::to_value(super::control::Hostinfo::new(hostname, routes))
+        .expect("Hostinfo serialization is infallible");
+    info["Userspace"] = true.into();
+    info["UserspaceRouter"] = true.into();
+    info["NetInfo"] = serde_json::json!({"PreferredDERP":home.unwrap_or(0),"WorkingUDP":false,"WorkingIPv6":false,"MappingVariesByDestIP":false});
+    info
+}
 fn bad(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -148,7 +156,7 @@ impl ControlSession {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tailscale: announce timeout"))??;
         self.send = self.send.clone().ready().await.map_err(io::Error::other)?;
         let payload=serde_json::to_vec(&serde_json::json!({"Version":CAPABILITY_VERSION,"NodeKey":node,"DiscoKey":format!("discokey:{}",super::control::to_hex(&disco)),
-            "Stream":true,"KeepAlive":true,"Compress":"","Hostinfo":{"OS":"linux","Hostname":hostname,"RoutableIPs":routes,"Userspace":true,"UserspaceRouter":true,"NetInfo":{"PreferredDERP":home.unwrap_or(0),"WorkingUDP":false,"WorkingIPv6":false,"MappingVariesByDestIP":false}}})).map_err(io::Error::other)?;
+            "Stream":true,"KeepAlive":true,"Compress":"","Hostinfo":map_hostinfo(hostname,routes,home)})).map_err(io::Error::other)?;
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("{}/machine/map", self.origin))
@@ -182,8 +190,7 @@ impl ControlSession {
     ) -> io::Result<()> {
         self.send = self.send.clone().ready().await.map_err(io::Error::other)?;
         let payload=serde_json::to_vec(&serde_json::json!({"Version":CAPABILITY_VERSION,"NodeKey":node,"DiscoKey":format!("discokey:{}",super::control::to_hex(&disco)),
-            "Stream":false,"OmitPeers":true,"Hostinfo":{"OS":"linux","Hostname":hostname,
-                "RoutableIPs":routes,"Userspace":true,"UserspaceRouter":true,"NetInfo":{"PreferredDERP":home.unwrap_or(0),"WorkingUDP":false}}})).map_err(io::Error::other)?;
+            "Stream":false,"OmitPeers":true,"Hostinfo":map_hostinfo(hostname,routes,home)})).map_err(io::Error::other)?;
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("{}/machine/map", self.origin))
@@ -217,8 +224,7 @@ impl ControlSession {
             let payload = serde_json::to_vec(&serde_json::json!({
                 "Version": CAPABILITY_VERSION, "NodeKey": node_key,
                 "ReadOnly": false, "Stream": false, "KeepAlive": false, "Compress": "",
-                "Hostinfo": { "OS": "linux", "Hostname": hostname,
-                    "NetInfo": { "PreferredDERP": home.unwrap_or(0) } }
+                "Hostinfo": map_hostinfo(hostname, &[], home)
             }))
             .map_err(io::Error::other)?;
             let req = http::Request::builder()
@@ -415,7 +421,46 @@ fn decode_map(bytes: &[u8]) -> io::Result<MapResponse> {
     if size != bytes.len() - 4 {
         return Err(bad("tailscale: invalid map frame length"));
     }
-    serde_json::from_slice(&bytes[4..]).map_err(|_| bad("tailscale: invalid map response"))
+    serde_json::from_slice(&bytes[4..]).map_err(|error| {
+        // Keep only JSON structure and locations, never peer addresses, keys,
+        // names or other string values from the control response.
+        #[cfg(target_os = "linux")]
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes[4..]) {
+            use std::{io::Write, os::unix::fs::OpenOptionsExt};
+            let diagnostic = serde_json::json!({"line":error.line(), "column":error.column(), "shape":map_shape(&value, 0)});
+            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)
+                .open("/var/run/forkop/ui-state/tailscale-map-failure.json") {
+                let _ = file.write_all(diagnostic.to_string().as_bytes());
+            }
+        }
+        bad("tailscale: invalid map response")
+    })
+}
+
+fn map_shape(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+    use serde_json::Value;
+    if depth > 8 {
+        return Value::String("nested".into());
+    }
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), map_shape(value, depth + 1)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(3)
+                .map(|v| map_shape(v, depth + 1))
+                .collect(),
+        ),
+        Value::Null => Value::Null,
+        Value::String(_) => Value::String("string".into()),
+        Value::Bool(_) => Value::String("boolean".into()),
+        Value::Number(_) => Value::String("number".into()),
+    }
 }
 
 async fn encrypt_records<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
@@ -487,6 +532,15 @@ async fn decrypt_records<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWri
 mod tests {
     use super::*;
 
+    #[test]
+    fn map_failure_shape_retains_nulls_without_string_values() {
+        let value = serde_json::json!({"Node":{"Key":"private-test-value", "Addresses":null}});
+        let shape = map_shape(&value, 0);
+        assert_eq!(shape["Node"]["Addresses"], serde_json::Value::Null);
+        assert_eq!(shape["Node"]["Key"], "string");
+        assert!(!shape.to_string().contains("private-test-value"));
+    }
+
     #[tokio::test]
     async fn stream_preserves_fragmented_and_coalesced_frames() {
         let (client, server) = tokio::io::duplex(65536);
@@ -548,6 +602,10 @@ mod tests {
                 .unwrap();
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(value["Hostinfo"]["NetInfo"]["PreferredDERP"], 7);
+            assert_eq!(
+                value["Hostinfo"]["IPNVersion"],
+                concat!("1.80.0-rustx", env!("CARGO_PKG_VERSION"))
+            );
             assert_eq!(value["Stream"], false);
             let json = br#"{"Node":{"ID":1,"Key":"nodekey:test","Addresses":["100.64.0.1/32"]},"Peers":[]}"#;
             let mut frame = (json.len() as u32).to_le_bytes().to_vec();
@@ -591,6 +649,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stream_and_announcement_preserve_client_hostinfo() {
+        let (client, server) = tokio::io::duplex(65536);
+        let task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server).await.unwrap();
+            for streaming in [false, true] {
+                let (request, mut response) = connection.accept().await.unwrap().unwrap();
+                let bytes = body(http::Response::new(request.into_body()))
+                    .await
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["Stream"], streaming);
+                let info = &value["Hostinfo"];
+                assert_eq!(
+                    info["IPNVersion"],
+                    concat!("1.80.0-rustx", env!("CARGO_PKG_VERSION"))
+                );
+                assert!(info.get("Distro").is_some());
+                assert!(info.get("DistroVersion").is_some());
+                assert_eq!(info["RoutableIPs"][0], "192.168.1.0/24");
+                response
+                    .send_response(http::Response::new(()), true)
+                    .unwrap();
+            }
+            while connection.accept().await.is_some() {}
+        });
+        let (send, connection) = h2::client::handshake(client).await.unwrap();
+        let mut session = ControlSession {
+            send,
+            origin: "https://example.com".into(),
+            _tasks: Tasks(vec![
+                task,
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                }),
+            ]),
+        };
+        session
+            .map_stream_with_routes(
+                "nodekey:test",
+                "router",
+                Some(7),
+                [1; 32],
+                &["192.168.1.0/24".into()],
+            )
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn map_framing_and_assigned_addresses() {
         let json = br#"{"Node":{"ID":123,"Key":"nodekey:test","Addresses":["100.64.0.2/32"]}}"#;
@@ -600,6 +707,15 @@ mod tests {
         assert_eq!(map.node.unwrap().addresses, ["100.64.0.2/32"]);
         assert!(decode_map(&frame[..frame.len() - 1]).is_err());
         assert!(decode_map(&[0; 3]).is_err());
+    }
+
+    #[test]
+    fn health_map_without_assigned_addresses_is_valid_protocol() {
+        let json = br#"{"Node":{"ID":123,"Key":"nodekey:test","Addresses":null,"AllowedIPs":null,"Endpoints":null},"Health":["device is not ready"]}"#;
+        let mut frame = (json.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(json);
+        let map = decode_map(&frame).unwrap();
+        assert!(map.node.unwrap().addresses.is_empty());
     }
 
     #[test]
@@ -706,11 +822,7 @@ mod tests {
                 version: CAPABILITY_VERSION,
                 node_key: "nodekey:test".into(),
                 auth: None,
-                hostinfo: super::super::control::Hostinfo {
-                    os: "linux".into(),
-                    hostname: "test".into(),
-                    routable_ips: vec![],
-                },
+                hostinfo: super::super::control::Hostinfo::new("test", &[]),
                 ephemeral: false,
                 followup: None,
             })
