@@ -128,7 +128,8 @@ impl WebBridge {
                 {
                     connection.pending = bytes;
                 }
-                if !connection.pending.is_empty() && socket.can_send()
+                if !connection.pending.is_empty()
+                    && socket.can_send()
                     && let Ok(n) = socket.send_slice(&connection.pending)
                 {
                     connection.pending.drain(..n);

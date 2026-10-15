@@ -433,10 +433,10 @@ pub fn spawn_tailscale_engine_with_tun(
                     for packet in packets {
                         if let Some(tun) = &tun
                             && lan_approved
-                                && super::lan::permitted(&packet, &cfg.advertise_routes, &lan_rules)
-                            {
-                                let _ = tun.write(&packet);
-                                continue;
+                            && super::lan::permitted(&packet, &cfg.advertise_routes, &lan_rules)
+                        {
+                            let _ = tun.write(&packet);
+                            continue;
                         }
                         if super::mesh::packet_ips(&packet)
                             .is_some_and(|(_, dst, _)| mesh.local_ips().contains(&dst))
@@ -544,7 +544,6 @@ fn rand_seed() -> u64 {
     getrandom::fill(&mut b).expect("getrandom seed");
     u64::from_le_bytes(b)
 }
-
 
 async fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {
     let s = format!("{host}:{port}");
@@ -711,4 +710,3 @@ mod mesh_tests {
         drop(shared);
     }
 }
-
