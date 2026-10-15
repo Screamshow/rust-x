@@ -13,9 +13,8 @@
 //! Only what a listener can actually serve lives here. `http` and `quic` are
 //! still refused by the config validator with a message saying so, because a
 //! listener that binds a port and then hangs on every connection is worse than
-//! one that refuses to start. The XHTTP half is HTTP/1.1 only -- the wire our
-//! own client speaks, and the one a reference client falls back to on a
-//! cleartext dial -- so an `h2` XHTTP server is the piece still missing there.
+//! one that refuses to start. XHTTP shares its split-session table across
+//! HTTP/1.1 connections and HTTP/2 streams.
 
 use std::collections::HashMap;
 use std::io;
@@ -65,7 +64,7 @@ impl Kind {
 /// session spans several connections, so it cannot live on any of them.
 type SessionTable = Arc<Mutex<HashMap<String, Arc<XhttpSession>>>>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Transport {
     kind: Kind,
     /// Path the request line must carry. `/` when the config gave none, which is
@@ -176,7 +175,7 @@ impl Transport {
         }
         if self.kind == Kind::Xhttp {
             if crate::inbound::stream_alpn(&stream) == Some(b"h2") {
-                return Accepted::xhttp_h2(stream, &self.path).await;
+                return Accepted::xhttp_h2(stream, self).await;
             }
             return self.xhttp_accept(stream).await.map(Accepted::Once);
         }
@@ -389,14 +388,14 @@ impl Accepted {
     }
 
     /// The XHTTP HTTP/2 half: handshake, and accept streams on the path.
-    async fn xhttp_h2(stream: AnyStream, path: &str) -> anyhow::Result<Self> {
+    async fn xhttp_h2(stream: AnyStream, transport: &Transport) -> anyhow::Result<Self> {
         let conn = crate::outbound::transport::h2io::server_builder()
             .handshake(stream)
             .await
             .map_err(|e| anyhow::anyhow!("xhttp h2: handshake: {e}"))?;
         Ok(Self::XhttpH2(Box::new(XhttpH2Accept {
             conn: Some(conn),
-            path: path.to_string(),
+            transport: transport.clone(),
             first: true,
         })))
     }
@@ -615,7 +614,7 @@ where
 
 pub(crate) struct XhttpH2Accept {
     conn: Option<h2::server::Connection<AnyStream, Bytes>>,
-    path: String,
+    transport: Transport,
     first: bool,
 }
 
@@ -638,7 +637,29 @@ impl XhttpH2Accept {
             let req_path = request.uri().path().to_string();
             let method = request.method().as_str().to_string();
 
-            if method != "POST" || !xhttp_h2_path_matches(&req_path, &self.path) {
+            let query = request.uri().query();
+            let headers = request
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                })
+                .collect::<Vec<_>>();
+            let rest = req_path.strip_prefix(&self.transport.path).unwrap_or("");
+            let trimmed = rest.trim_matches('/');
+            let segments = if trimmed.is_empty() {
+                vec![]
+            } else {
+                trimmed.split('/').collect::<Vec<_>>()
+            };
+            let sid = self.transport.session_id(&segments, query, &headers);
+            let seq = self.transport.seq_present(&segments, query, &headers);
+            if !xhttp_h2_path_matches(&req_path, &self.transport.path)
+                || (sid.is_none() && (method != "POST" || !segments.is_empty()))
+            {
                 let response = http::Response::builder().status(404).body(()).unwrap();
                 let _ = responder.send_response(response, true);
                 if first {
@@ -649,8 +670,58 @@ impl XhttpH2Accept {
                     let _ = xhttp_h2_drive(conn).await;
                     anyhow::bail!(
                         "xhttp h2: rejected {method} {req_path:?} (expected POST {})",
-                        self.path
+                        self.transport.path
                     );
+                }
+                continue;
+            }
+
+            if let Some(sid) = sid {
+                // The shared table belongs to the listener, not this h2
+                // connection: upload and download may arrive on either one.
+                let (session, protocol) = {
+                    let mut table = self
+                        .transport
+                        .sessions
+                        .lock()
+                        .expect("xhttp table poisoned");
+                    if let Some(session) = table.get(&sid) {
+                        (Arc::clone(session), None)
+                    } else {
+                        let (session, up_rx, down_tx) = XhttpSession::new();
+                        let protocol = Box::new(XhttpStream {
+                            inner: xhttp_bridge(up_rx, down_tx),
+                            listed: Some((Arc::clone(&self.transport.sessions), sid.clone())),
+                        }) as AnyStream;
+                        table.insert(sid, Arc::clone(&session));
+                        (session, Some(protocol))
+                    }
+                };
+                if method == "GET" && !seq {
+                    if let Some(down) = session.take_down() {
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/octet-stream")
+                            .body(())
+                            .unwrap();
+                        let send = responder.send_response(response, false)?;
+                        tokio::spawn(xhttp_h2_download_task(send, down, session));
+                    } else {
+                        let _ = responder.send_response(
+                            http::Response::builder().status(409).body(()).unwrap(),
+                            true,
+                        );
+                    }
+                } else {
+                    tokio::spawn(xhttp_h2_upload_task(
+                        request.into_body(),
+                        responder,
+                        session,
+                        seq,
+                    ));
+                }
+                if protocol.is_some() {
+                    return Ok(protocol);
                 }
                 continue;
             }
@@ -669,6 +740,72 @@ impl XhttpH2Accept {
                 h2: h2_stream,
             })));
         }
+    }
+}
+
+async fn xhttp_h2_download_task(
+    mut send: h2::SendStream<Bytes>,
+    mut down: mpsc::Receiver<Vec<u8>>,
+    session: Arc<XhttpSession>,
+) {
+    let _ = async {
+        loop {
+            let chunk = tokio::select! {
+                _ = std::future::poll_fn(|cx|send.poll_reset(cx)) => break,
+                chunk = down.recv() => match chunk {Some(chunk)=>chunk,None=>break},
+            };
+            let mut chunk = Bytes::from(chunk);
+            while !chunk.is_empty() {
+                send.reserve_capacity(chunk.len());
+                let capacity = std::future::poll_fn(|cx| send.poll_capacity(cx))
+                    .await
+                    .ok_or_else(|| io::Error::other("xhttp: h2 download closed"))?
+                    .map_err(io::Error::other)?;
+                if capacity == 0 {
+                    continue;
+                }
+                let n = capacity.min(chunk.len());
+                send.send_data(chunk.split_to(n), false)
+                    .map_err(io::Error::other)?;
+            }
+        }
+        send.send_data(Bytes::new(), true).map_err(io::Error::other)
+    }
+    .await;
+    session.close_up();
+}
+
+async fn xhttp_h2_upload_task(
+    mut recv: h2::RecvStream,
+    mut responder: h2::server::SendResponse<Bytes>,
+    session: Arc<XhttpSession>,
+    packet: bool,
+) {
+    // Stream-up needs response headers before EOF. Packet-up is acknowledged
+    // after enqueueing its complete body so successive packets cannot overtake.
+    if !packet
+        && responder
+            .send_response(http::Response::new(()), true)
+            .is_err()
+    {
+        return;
+    }
+    while let Some(chunk) = recv.data().await {
+        let Ok(chunk) = chunk else {
+            session.close_up();
+            return;
+        };
+        let size = chunk.len();
+        if session.push(chunk.to_vec()).await.is_err() {
+            return;
+        }
+        if recv.flow_control().release_capacity(size).is_err() {
+            session.close_up();
+            return;
+        }
+    }
+    if packet {
+        let _ = responder.send_response(http::Response::new(()), true);
     }
 }
 

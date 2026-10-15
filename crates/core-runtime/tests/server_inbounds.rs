@@ -1409,6 +1409,26 @@ async fn vless_server_over_xhttp_h2_packet_up_carries_our_own_client_traffic() {
 }
 
 #[tokio::test]
+async fn vless_server_over_xhttp_h2_stream_up_multi_write() {
+    let _guard = test_guard().await;
+    let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
+    let mut server = vless_server(uuid, "");
+    server["transport"] = json!({"type":"xhttp","path":"/bench"});
+    let mut s_tls = server_tls();
+    s_tls["alpn"] = json!(["h2"]);
+    server["tls"] = s_tls;
+    let mut client = vless_client(uuid, "");
+    client["transport"] = json!({"type":"xhttp","path":"/bench","mode":"stream-up"});
+    let mut c_tls = client_tls();
+    c_tls["alpn"] = json!(["h2"]);
+    client["tls"] = c_tls;
+    let large = vec![0x5a; 128 * 1024];
+    through_our_own_client_rounds(server, client, &[b"first", &large, b"last"])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn vless_server_over_xhttp_packet_up_multi_write() {
     let _guard = test_guard().await;
     let uuid = "b831381d-6324-4d53-ad4f-8cda48b30811";
