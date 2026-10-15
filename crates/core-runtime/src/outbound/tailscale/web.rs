@@ -123,16 +123,16 @@ impl WebBridge {
                 }
             }
             if let Some(rx) = &mut connection.from_local {
-                if connection.pending.is_empty() {
-                    if let Ok(bytes) = rx.try_recv() {
-                        connection.pending = bytes;
-                    }
+                if connection.pending.is_empty()
+                    && let Ok(bytes) = rx.try_recv()
+                {
+                    connection.pending = bytes;
                 }
-                if !connection.pending.is_empty() && socket.can_send() {
-                    if let Ok(n) = socket.send_slice(&connection.pending) {
-                        connection.pending.drain(..n);
-                        connection.activity = Instant::now();
-                    }
+                if !connection.pending.is_empty() && socket.can_send()
+                    && let Ok(n) = socket.send_slice(&connection.pending)
+                {
+                    connection.pending.drain(..n);
+                    connection.activity = Instant::now();
                 }
                 if rx.is_closed() && rx.is_empty() && connection.pending.is_empty() {
                     socket.close();

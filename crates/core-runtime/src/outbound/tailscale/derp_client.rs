@@ -335,8 +335,9 @@ impl RelayManager {
                         tokio::select! {
                             packet = outbound.recv() => {
                                 let Some((destination, packet)) = packet else { return; };
-                                if let Err(error) = client.send(destination, &packet) {
-                                    if error.kind() != io::ErrorKind::WouldBlock { break; }
+                                if let Err(error) = client.send(destination, &packet)
+                                    && error.kind() != io::ErrorKind::WouldBlock {
+                                    break;
                                 }
                             }
                             packet = client.rx.recv() => {

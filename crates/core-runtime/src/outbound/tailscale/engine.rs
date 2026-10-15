@@ -259,10 +259,8 @@ pub fn spawn_tailscale_engine_with_tun(
             .luci_access
             .then(|| super::web::WebBridge::new(cfg.ssh_access));
         let mut tcp_conns: HashMap<u32, TcpConn> = HashMap::new();
-        let mut udp_sessions: HashMap<
-            u16,
-            (SocketHandle, SocketAddr, mpsc::Sender<Vec<u8>>, Instant),
-        > = HashMap::new();
+        type UdpSession = (SocketHandle, SocketAddr, mpsc::Sender<Vec<u8>>, Instant);
+        let mut udp_sessions: HashMap<u16, UdpSession> = HashMap::new();
         let mut _peers: Vec<PeerObj> = Vec::new();
 
         let mut next_ephemeral_port: u16 = 40000;
@@ -433,13 +431,12 @@ pub fn spawn_tailscale_engine_with_tun(
             if let Some(mesh) = &mut mesh {
                 if let Ok(packets) = mesh.poll().await {
                     for packet in packets {
-                        if let Some(tun) = &tun {
-                            if lan_approved
+                        if let Some(tun) = &tun
+                            && lan_approved
                                 && super::lan::permitted(&packet, &cfg.advertise_routes, &lan_rules)
                             {
                                 let _ = tun.write(&packet);
                                 continue;
-                            }
                         }
                         if super::mesh::packet_ips(&packet)
                             .is_some_and(|(_, dst, _)| mesh.local_ips().contains(&dst))
@@ -546,6 +543,22 @@ fn rand_seed() -> u64 {
     let mut b = [0u8; 8];
     getrandom::fill(&mut b).expect("getrandom seed");
     u64::from_le_bytes(b)
+}
+
+
+async fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {
+    let s = format!("{host}:{port}");
+    tokio::net::lookup_host(&s)
+        .await?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "domain lookup failed"))
+}
+
+pub async fn resolve_target(target: &Target) -> io::Result<SocketAddr> {
+    match target {
+        Target::Ip(addr) => Ok(*addr),
+        Target::Domain(host, port) => resolve_host(host, *port).await,
+    }
 }
 
 #[cfg(test)]
@@ -699,17 +712,3 @@ mod mesh_tests {
     }
 }
 
-async fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {
-    let s = format!("{host}:{port}");
-    tokio::net::lookup_host(&s)
-        .await?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "domain lookup failed"))
-}
-
-pub async fn resolve_target(target: &Target) -> io::Result<SocketAddr> {
-    match target {
-        Target::Ip(addr) => Ok(*addr),
-        Target::Domain(host, port) => resolve_host(host, *port).await,
-    }
-}

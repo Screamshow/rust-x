@@ -30,32 +30,7 @@ pub fn permitted(packet: &[u8], routes: &[IpCidr], rules: &[Rule]) -> bool {
 pub struct LanTun {
     fd: std::os::fd::OwnedFd,
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn subnet_acl_rejects_other_destinations_protocols_and_fragments() {
-        let rules: Vec<Rule> = serde_json::from_value(serde_json::json!([{"SrcIPs":["100.64.0.0/10"],"IPProto":[17],"DstPorts":[{"IP":"192.168.1.0/24","Ports":{"First":53,"Last":53}}]}])).unwrap();
-        let routes = vec!["192.168.1.0/24".parse().unwrap()];
-        let mut packet = vec![0; 28];
-        packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
-        packet[9] = 17;
-        packet[12..16].copy_from_slice(&[100, 64, 0, 2]);
-        packet[16..20].copy_from_slice(&[192, 168, 1, 2]);
-        packet[22..24].copy_from_slice(&53u16.to_be_bytes());
-        assert!(permitted(&packet, &routes, &rules));
-        assert!(!permitted(&packet, &routes, &[]));
-        packet[22..24].copy_from_slice(&54u16.to_be_bytes());
-        assert!(!permitted(&packet, &routes, &rules));
-        packet[22..24].copy_from_slice(&53u16.to_be_bytes());
-        packet[16] = 8;
-        assert!(!permitted(&packet, &routes, &rules));
-        packet[16] = 192;
-        packet[6] = 0x20;
-        assert!(!permitted(&packet, &routes, &rules));
-    }
-}
+
 #[cfg(target_os = "linux")]
 impl LanTun {
     pub fn open() -> io::Result<Self> {
@@ -119,5 +94,32 @@ impl LanTun {
     }
     pub fn read(&self) -> io::Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn subnet_acl_rejects_other_destinations_protocols_and_fragments() {
+        let rules: Vec<Rule> = serde_json::from_value(serde_json::json!([{"SrcIPs":["100.64.0.0/10"],"IPProto":[17],"DstPorts":[{"IP":"192.168.1.0/24","Ports":{"First":53,"Last":53}}]}])).unwrap();
+        let routes = vec!["192.168.1.0/24".parse().unwrap()];
+        let mut packet = vec![0; 28];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[100, 64, 0, 2]);
+        packet[16..20].copy_from_slice(&[192, 168, 1, 2]);
+        packet[22..24].copy_from_slice(&53u16.to_be_bytes());
+        assert!(permitted(&packet, &routes, &rules));
+        assert!(!permitted(&packet, &routes, &[]));
+        packet[22..24].copy_from_slice(&54u16.to_be_bytes());
+        assert!(!permitted(&packet, &routes, &rules));
+        packet[22..24].copy_from_slice(&53u16.to_be_bytes());
+        packet[16] = 8;
+        assert!(!permitted(&packet, &routes, &rules));
+        packet[16] = 192;
+        packet[6] = 0x20;
+        assert!(!permitted(&packet, &routes, &rules));
     }
 }
