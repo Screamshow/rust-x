@@ -147,7 +147,9 @@ impl WebBridge {
             sockets.remove(handle);
         }
         for port in [80, 443, 22] {
-            if port == 22 && !self.ssh_access { continue; }
+            if port == 22 && !self.ssh_access {
+                continue;
+            }
             if self.connections.len() >= 32 {
                 break;
             }
@@ -193,7 +195,14 @@ mod tests {
             bridge.poll(&mut sockets);
             let mut ports: Vec<_> = bridge.connections.values().map(|c| c.port).collect();
             ports.sort();
-            assert_eq!(ports, if enabled { vec![22, 80, 443] } else { vec![80, 443] });
+            assert_eq!(
+                ports,
+                if enabled {
+                    vec![22, 80, 443]
+                } else {
+                    vec![80, 443]
+                }
+            );
             bridge.poll(&mut sockets);
             assert_eq!(bridge.connections.len(), if enabled { 3 } else { 2 });
         }

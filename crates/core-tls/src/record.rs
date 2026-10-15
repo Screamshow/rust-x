@@ -212,7 +212,9 @@ impl Opener {
     pub fn open(&mut self, record: &[u8]) -> io::Result<(ContentType, Vec<u8>)> {
         let mut copy = record.to_vec();
         let (kind, len) = self.open_in_place(&mut copy)?;
-        Ok((kind, copy[5..5 + len].to_vec()))
+        copy.copy_within(5..5 + len, 0);
+        copy.truncate(len);
+        Ok((kind, copy))
     }
 
     /// Open one whole record where it lies. The plaintext is then

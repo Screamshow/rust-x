@@ -10,12 +10,12 @@ pub mod control;
 pub mod derp;
 pub mod derp_client;
 pub mod engine;
+pub mod lan;
 pub mod mesh;
 pub mod noise;
+pub mod service;
 pub mod session;
 pub mod web;
-pub mod lan;
-pub mod service;
 
 use std::io;
 use std::net::IpAddr;
@@ -191,8 +191,14 @@ impl Tailscale {
         mesh.update_peers(map.as_ref().and_then(|m| m.peers.as_deref()).unwrap_or(&[]));
         crate::logging::debug(format_args!("tailscale: selected home relay {:?}", home));
         let disco = mesh.disco_public();
-        let tun = if self.cfg.system_interface && !self.cfg.advertise_routes.is_empty() { Some(lan::LanTun::open()?) } else { None };
-        if tun.is_some() { mesh.set_local_routes(self.cfg.advertise_routes.clone()); }
+        let tun = if self.cfg.system_interface && !self.cfg.advertise_routes.is_empty() {
+            Some(lan::LanTun::open()?)
+        } else {
+            None
+        };
+        if tun.is_some() {
+            mesh.set_local_routes(self.cfg.advertise_routes.clone());
+        }
         let shared = engine::spawn_tailscale_engine_with_tun(
             self.cfg.clone(),
             local_vip,
@@ -231,7 +237,10 @@ impl Tailscale {
                                     cfg.hostname.as_deref().unwrap_or("rust-x"),
                                     home,
                                     disco,
-                                    &cfg.advertise_routes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                                    &cfg.advertise_routes
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>(),
                                 )
                                 .await?,
                         );
@@ -248,10 +257,15 @@ impl Tailscale {
                             named_rules.insert("base".to_string(), filter);
                         }
                         if let Some(filters) = &map.packet_filters {
-                            if filters.get("*").is_some_and(Option::is_none) { named_rules.clear(); }
+                            if filters.get("*").is_some_and(Option::is_none) {
+                                named_rules.clear();
+                            }
                             for (name, value) in filters {
-                                if let Some(value) = value { named_rules.insert(name.clone(), value.clone()); }
-                                else { named_rules.remove(name); }
+                                if let Some(value) = value {
+                                    named_rules.insert(name.clone(), value.clone());
+                                } else {
+                                    named_rules.remove(name);
+                                }
                             }
                         }
                         rules = named_rules.values().flatten().cloned().collect();
@@ -285,14 +299,29 @@ impl Tailscale {
                         // never continue accepting traffic with stale local addresses.
                         if let Some(local) = &map.node {
                             addresses_valid = local.addresses == expected_addresses;
-                            shared.routes_approved.store(!cfg.advertise_routes.is_empty() && cfg.advertise_routes.iter().all(|route| local.allowed_ips.iter().any(|a| a.parse::<smoltcp::wire::IpCidr>().ok().as_ref() == Some(route))), Ordering::Relaxed);
+                            shared.routes_approved.store(
+                                !cfg.advertise_routes.is_empty()
+                                    && cfg.advertise_routes.iter().all(|route| {
+                                        local.allowed_ips.iter().any(|a| {
+                                            a.parse::<smoltcp::wire::IpCidr>().ok().as_ref()
+                                                == Some(route)
+                                        })
+                                    }),
+                                Ordering::Relaxed,
+                            );
                         }
                         let peers = if addresses_valid {
                             peers.values().cloned().collect()
                         } else {
                             vec![]
                         };
-                        let _ = shared.cmd_tx.send(Cmd::UpdateLanApproval { approved: addresses_valid && shared.routes_approved.load(Ordering::Relaxed) }).await;
+                        let _ = shared
+                            .cmd_tx
+                            .send(Cmd::UpdateLanApproval {
+                                approved: addresses_valid
+                                    && shared.routes_approved.load(Ordering::Relaxed),
+                            })
+                            .await;
                         if shared
                             .cmd_tx
                             .send(Cmd::UpdatePeers {
@@ -305,12 +334,19 @@ impl Tailscale {
                             break;
                         }
                         delay = 0;
-                        shared.control_connected.store(addresses_valid, std::sync::atomic::Ordering::Relaxed);
+                        shared
+                            .control_connected
+                            .store(addresses_valid, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(error) => {
                         shared.routes_approved.store(false, Ordering::Relaxed);
-                        let _ = shared.cmd_tx.send(Cmd::UpdateLanApproval { approved: false }).await;
-                        shared.control_connected.store(false, std::sync::atomic::Ordering::Relaxed);
+                        let _ = shared
+                            .cmd_tx
+                            .send(Cmd::UpdateLanApproval { approved: false })
+                            .await;
+                        shared
+                            .control_connected
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                         crate::logging::warn(format_args!(
                             "tailscale: map synchronization failed: {}",
                             error

@@ -161,6 +161,14 @@ pub struct ConnView {
     pub meta: ConnMeta,
 }
 
+/// Process-wide byte counters without collecting connection metadata.
+pub fn traffic_totals() -> (u64, u64) {
+    (
+        UPLOAD_TOTAL.load(Ordering::Relaxed),
+        DOWNLOAD_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
 /// Live entries plus the process-wide totals.
 pub fn snapshot() -> (Vec<ConnView>, u64, u64) {
     let entries: Vec<Arc<Shared>> = registry()

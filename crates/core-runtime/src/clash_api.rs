@@ -721,12 +721,12 @@ async fn stream_traffic(
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     ticker.tick().await;
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let (_, mut prev_up, mut prev_down) = clash_state::snapshot();
+    let (mut prev_up, mut prev_down) = clash_state::traffic_totals();
     let mut previous = tokio::time::Instant::now();
     loop {
         ticker.tick().await;
         let now = tokio::time::Instant::now();
-        let (_, up, down) = clash_state::snapshot();
+        let (up, down) = clash_state::traffic_totals();
         let elapsed = now.duration_since(previous);
         let rate_up = traffic_rate(up, prev_up, elapsed);
         let rate_down = traffic_rate(down, prev_down, elapsed);

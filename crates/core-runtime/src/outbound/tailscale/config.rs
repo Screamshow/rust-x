@@ -169,7 +169,10 @@ impl TailscaleConfig {
             .map(PathBuf::from);
 
         Ok(Self {
-            ssh_access: obj.get("ssh_access").and_then(Value::as_bool).unwrap_or(false),
+            ssh_access: obj
+                .get("ssh_access")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             luci_access: obj
                 .get("luci_access")
                 .and_then(Value::as_bool)

@@ -54,7 +54,9 @@ pub struct DirectMesh {
 }
 
 impl DirectMesh {
-    pub fn set_local_routes(&mut self, routes: Vec<smoltcp::wire::IpCidr>) { self.local_routes = routes; }
+    pub fn set_local_routes(&mut self, routes: Vec<smoltcp::wire::IpCidr>) {
+        self.local_routes = routes;
+    }
     pub async fn bind(private: StaticSecret, local: Vec<IpAddr>, port: u16) -> io::Result<Self> {
         let mut disco = [0; 32];
         getrandom::fill(&mut disco)
@@ -171,7 +173,12 @@ impl DirectMesh {
                 "tailscale: packet exceeds MTU 1280",
             ));
         }
-        if !self.local.contains(&source) && !self.local_routes.iter().any(|r| r.contains_addr(&source.into())) {
+        if !self.local.contains(&source)
+            && !self
+                .local_routes
+                .iter()
+                .any(|r| r.contains_addr(&source.into()))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "tailscale: invalid source address",
@@ -464,7 +471,11 @@ impl DirectMesh {
                     if let Some((source, dest, length)) = packet_ips(&plain)
                         && length <= MAX_IP_PACKET
                         && peer.addresses.contains(&source)
-                        && (self.local.contains(&dest) || self.local_routes.iter().any(|r| r.contains_addr(&dest.into())))
+                        && (self.local.contains(&dest)
+                            || self
+                                .local_routes
+                                .iter()
+                                .any(|r| r.contains_addr(&dest.into())))
                     {
                         plain.truncate(length);
                         packets.push(plain);

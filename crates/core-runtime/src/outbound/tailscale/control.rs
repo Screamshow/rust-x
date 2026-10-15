@@ -105,7 +105,8 @@ pub struct MapRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerObj {
-    #[serde(rename="DiscoKey", default)] pub disco_key: Option<String>,
+    #[serde(rename = "DiscoKey", default)]
+    pub disco_key: Option<String>,
     #[serde(rename = "HomeDERP", default)]
     pub home_derp: Option<u16>,
     #[serde(rename = "ID")]
@@ -128,8 +129,10 @@ pub struct PeerObj {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MapResponse {
-    #[serde(rename="PeersChanged", default)] pub peers_changed: Option<Vec<PeerObj>>,
-    #[serde(rename="PeersRemoved", default)] pub peers_removed: Option<Vec<u64>>,
+    #[serde(rename = "PeersChanged", default)]
+    pub peers_changed: Option<Vec<PeerObj>>,
+    #[serde(rename = "PeersRemoved", default)]
+    pub peers_removed: Option<Vec<u64>>,
     #[serde(rename = "PacketFilter", default)]
     pub packet_filter: Option<Vec<super::access::Rule>>,
     #[serde(rename = "PacketFilters", default)]

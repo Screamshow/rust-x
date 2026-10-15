@@ -68,13 +68,23 @@ fn matches(pattern: &str, ip: IpAddr, bits: Option<u8>) -> bool {
 pub fn allows(rules: &[Rule], source: IpAddr, destination: IpAddr, port: u16) -> bool {
     allows_protocol(rules, source, destination, port, 6)
 }
-pub fn allows_protocol(rules: &[Rule], source: IpAddr, destination: IpAddr, port: u16, protocol: u16) -> bool {
+pub fn allows_protocol(
+    rules: &[Rule],
+    source: IpAddr,
+    destination: IpAddr,
+    port: u16,
+    protocol: u16,
+) -> bool {
     rules.iter().any(|r| {
-        (if r.protocols.is_empty() { matches!(protocol, 1 | 6 | 17 | 58) } else { r.protocols.contains(&protocol) })
-            && r.sources
-                .iter()
-                .enumerate()
-                .any(|(i, p)| matches(p, source, r.source_bits.get(i).copied()))
+        (if r.protocols.is_empty() {
+            matches!(protocol, 1 | 6 | 17 | 58)
+        } else {
+            r.protocols.contains(&protocol)
+        }) && r
+            .sources
+            .iter()
+            .enumerate()
+            .any(|(i, p)| matches(p, source, r.source_bits.get(i).copied()))
             && r.destinations.iter().any(|d| {
                 matches(&d.ip, destination, d.bits) && d.ports.first <= port && port <= d.ports.last
             })

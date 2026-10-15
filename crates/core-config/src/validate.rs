@@ -14191,8 +14191,12 @@ fn openvpn_push_dns_servers_decode(i: usize, value: &Value) -> Result<(), String
 
 fn tailscale_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("endpoints[{i}]");
-    if let Some(value)=obj.get("ssh_access") { ep_bool(value, &format!("{at}.ssh_access"), TS_EP, "ssh_access")?; }
-    if let Some(value)=obj.get("luci_access") { ep_bool(value, &format!("{at}.luci_access"), TS_EP, "luci_access")?; }
+    if let Some(value) = obj.get("ssh_access") {
+        ep_bool(value, &format!("{at}.ssh_access"), TS_EP, "ssh_access")?;
+    }
+    if let Some(value) = obj.get("luci_access") {
+        ep_bool(value, &format!("{at}.luci_access"), TS_EP, "luci_access")?;
+    }
     for key in obj.keys() {
         let k = key.as_str();
         if !KNOWN_TAILSCALE_FIELDS.contains(&k) && !DIALER_OUT_FIELDS.contains(&k) {

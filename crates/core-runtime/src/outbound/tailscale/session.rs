@@ -129,10 +129,23 @@ impl ControlSession {
         home: Option<u16>,
         disco: [u8; 32],
     ) -> io::Result<MapStream> {
-        self.map_stream_with_routes(node, hostname, home, disco, &[]).await
+        self.map_stream_with_routes(node, hostname, home, disco, &[])
+            .await
     }
-    pub async fn map_stream_with_routes(&mut self, node: &str, hostname: &str, home: Option<u16>, disco: [u8;32], routes: &[String]) -> io::Result<MapStream> {
-        tokio::time::timeout(Duration::from_secs(30), self.announce(node, hostname, home, disco, routes)).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tailscale: announce timeout"))??;
+    pub async fn map_stream_with_routes(
+        &mut self,
+        node: &str,
+        hostname: &str,
+        home: Option<u16>,
+        disco: [u8; 32],
+        routes: &[String],
+    ) -> io::Result<MapStream> {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.announce(node, hostname, home, disco, routes),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tailscale: announce timeout"))??;
         self.send = self.send.clone().ready().await.map_err(io::Error::other)?;
         let payload=serde_json::to_vec(&serde_json::json!({"Version":CAPABILITY_VERSION,"NodeKey":node,"DiscoKey":format!("discokey:{}",super::control::to_hex(&disco)),
             "Stream":true,"KeepAlive":true,"Compress":"","Hostinfo":{"OS":"linux","Hostname":hostname,"RoutableIPs":routes,"Userspace":true,"UserspaceRouter":true,"NetInfo":{"PreferredDERP":home.unwrap_or(0),"WorkingUDP":false,"WorkingIPv6":false,"MappingVariesByDestIP":false}}})).map_err(io::Error::other)?;

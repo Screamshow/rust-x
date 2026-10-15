@@ -701,10 +701,24 @@ fn main() -> ExitCode {
         "reload-plan" => cmd_reload_plan(&cmd_args),
         "run" => cmd_run(&cmd_args),
         #[cfg(any(feature = "rust-x", feature = "full"))]
-        "tailscale-ssh-capability" => { println!("1"); Ok(()) }
-        "tailscale-native-capability" => { println!("1"); Ok(()) }
+        "tailscale-ssh-capability" => {
+            println!("1");
+            Ok(())
+        }
+        "tailscale-native-capability" => {
+            println!("1");
+            Ok(())
+        }
         #[cfg(any(feature = "rust-x", feature = "full"))]
-        "tailscale-luci" => tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|e| e.to_string()).and_then(|runtime| runtime.block_on(core_runtime::outbound::tailscale::service::run()).map_err(|_| "native Tailscale service failed".to_string())),
+        "tailscale-luci" => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+            .and_then(|runtime| {
+                runtime
+                    .block_on(core_runtime::outbound::tailscale::service::run())
+                    .map_err(|_| "native Tailscale service failed".to_string())
+            }),
         "api" => cmd_api(&cmd_args),
         "generate" => cmd_generate(&cmd_args),
         "format" => cmd_format(&cmd_args),

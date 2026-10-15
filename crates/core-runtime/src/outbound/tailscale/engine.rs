@@ -30,7 +30,9 @@ use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSock};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum Cmd {
-    UpdateLanApproval { approved: bool },
+    UpdateLanApproval {
+        approved: bool,
+    },
     UpdateAccess {
         rules: Vec<super::access::Rule>,
     },
@@ -191,7 +193,13 @@ pub fn spawn_tailscale_engine_with_mesh(
 ) -> Arc<TailscaleShared> {
     spawn_tailscale_engine_with_tun(cfg, local_ip, cmd_rx, mesh, None)
 }
-pub fn spawn_tailscale_engine_with_tun(cfg: TailscaleConfig, local_ip: IpAddr, mut cmd_rx: mpsc::Receiver<Cmd>, mut mesh: Option<DirectMesh>, tun: Option<super::lan::LanTun>) -> Arc<TailscaleShared> {
+pub fn spawn_tailscale_engine_with_tun(
+    cfg: TailscaleConfig,
+    local_ip: IpAddr,
+    mut cmd_rx: mpsc::Receiver<Cmd>,
+    mut mesh: Option<DirectMesh>,
+    tun: Option<super::lan::LanTun>,
+) -> Arc<TailscaleShared> {
     let (cmd_tx, mut internal_cmd_rx) = mpsc::channel(128);
 
     // Forwarder from external commands to internal loop
@@ -247,7 +255,9 @@ pub fn spawn_tailscale_engine_with_tun(cfg: TailscaleConfig, local_ip: IpAddr, m
             .add_default_ipv6_route(std::net::Ipv6Addr::UNSPECIFIED);
 
         let mut sockets = SocketSet::new(vec![]);
-        let mut web = cfg.luci_access.then(|| super::web::WebBridge::new(cfg.ssh_access));
+        let mut web = cfg
+            .luci_access
+            .then(|| super::web::WebBridge::new(cfg.ssh_access));
         let mut tcp_conns: HashMap<u32, TcpConn> = HashMap::new();
         let mut udp_sessions: HashMap<
             u16,
@@ -264,7 +274,9 @@ pub fn spawn_tailscale_engine_with_tun(cfg: TailscaleConfig, local_ip: IpAddr, m
             // 1. Drain commands
             while let Ok(cmd) = internal_cmd_rx.try_recv() {
                 match cmd {
-                    Cmd::UpdateLanApproval { approved } => { lan_approved = approved; }
+                    Cmd::UpdateLanApproval { approved } => {
+                        lan_approved = approved;
+                    }
                     Cmd::UpdateAccess { rules } => {
                         lan_rules = rules.clone();
                         if let Some(web) = &mut web {
@@ -422,13 +434,29 @@ pub fn spawn_tailscale_engine_with_tun(cfg: TailscaleConfig, local_ip: IpAddr, m
                 if let Ok(packets) = mesh.poll().await {
                     for packet in packets {
                         if let Some(tun) = &tun {
-                            if lan_approved && super::lan::permitted(&packet, &cfg.advertise_routes, &lan_rules) { let _ = tun.write(&packet); continue; }
+                            if lan_approved
+                                && super::lan::permitted(&packet, &cfg.advertise_routes, &lan_rules)
+                            {
+                                let _ = tun.write(&packet);
+                                continue;
+                            }
                         }
-                        if super::mesh::packet_ips(&packet).is_some_and(|(_, dst, _)| mesh.local_ips().contains(&dst)) { device.rx.push_back(packet); }
+                        if super::mesh::packet_ips(&packet)
+                            .is_some_and(|(_, dst, _)| mesh.local_ips().contains(&dst))
+                        {
+                            device.rx.push_back(packet);
+                        }
                     }
                 }
                 if let Some(tun) = &tun {
-                    for _ in 0..64 { match tun.read() { Ok(Some(packet)) => { let _ = mesh.send(packet).await; }, _ => break } }
+                    for _ in 0..64 {
+                        match tun.read() {
+                            Ok(Some(packet)) => {
+                                let _ = mesh.send(packet).await;
+                            }
+                            _ => break,
+                        }
+                    }
                 }
             }
             // 3. Poll smoltcp stack
