@@ -62,6 +62,7 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = serde_json::json!({"type":"tailscale", "tag":"luci",
         "hostname":"forkop-router", "state_directory":"/etc/forkop-tailscale",
         "listen_port":41642, "luci_access":true});
+    config["ssh_access"] = Path::new("/etc/forkop-tailscale/ssh-enabled").exists().into();
     if !auth.is_empty() { config["auth_key"] = auth.into(); }
     let lan_config: Option<serde_json::Value> = std::fs::read_to_string("/etc/forkop-tailscale/lan.json").ok().map(|s| serde_json::from_str(&s)).transpose()?;
     if let Some(lan) = &lan_config {

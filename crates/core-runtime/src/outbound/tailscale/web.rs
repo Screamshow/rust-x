@@ -1,4 +1,4 @@
-//! Bounded userspace TCP listeners forwarding only ports 80/443 to loopback.
+//! Bounded userspace TCP listeners forwarding LuCI and optional SSH to loopback.
 use super::access::{Rule, allows};
 use smoltcp::{
     iface::{SocketHandle, SocketSet},
@@ -33,12 +33,14 @@ impl Drop for Connection {
 pub struct WebBridge {
     connections: HashMap<SocketHandle, Connection>,
     rules: Vec<Rule>,
+    ssh_access: bool,
 }
 impl WebBridge {
-    pub fn new() -> Self {
+    pub fn new(ssh_access: bool) -> Self {
         Self {
             connections: HashMap::new(),
             rules: vec![],
+            ssh_access,
         }
     }
     pub fn update_rules(&mut self, rules: Vec<Rule>) {
@@ -144,7 +146,8 @@ impl WebBridge {
             self.connections.remove(&handle);
             sockets.remove(handle);
         }
-        for port in [80, 443] {
+        for port in [80, 443, 22] {
+            if port == 22 && !self.ssh_access { continue; }
             if self.connections.len() >= 32 {
                 break;
             }
@@ -175,6 +178,24 @@ impl WebBridge {
                     activity: Instant::now(),
                 },
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ssh_listener_is_opt_in() {
+        for enabled in [false, true] {
+            let mut sockets = SocketSet::new(vec![]);
+            let mut bridge = WebBridge::new(enabled);
+            bridge.poll(&mut sockets);
+            let mut ports: Vec<_> = bridge.connections.values().map(|c| c.port).collect();
+            ports.sort();
+            assert_eq!(ports, if enabled { vec![22, 80, 443] } else { vec![80, 443] });
+            bridge.poll(&mut sockets);
+            assert_eq!(bridge.connections.len(), if enabled { 3 } else { 2 });
         }
     }
 }

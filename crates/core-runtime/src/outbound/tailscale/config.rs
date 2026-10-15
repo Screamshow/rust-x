@@ -16,6 +16,7 @@ pub const DEFAULT_LISTEN_PORT: u16 = 41641;
 #[derive(Clone, Debug)]
 pub struct TailscaleConfig {
     pub luci_access: bool,
+    pub ssh_access: bool,
     pub tag: String,
     pub state_directory: Option<PathBuf>,
     pub auth_key: Option<String>,
@@ -168,6 +169,7 @@ impl TailscaleConfig {
             .map(PathBuf::from);
 
         Ok(Self {
+            ssh_access: obj.get("ssh_access").and_then(Value::as_bool).unwrap_or(false),
             luci_access: obj
                 .get("luci_access")
                 .and_then(Value::as_bool)

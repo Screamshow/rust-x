@@ -247,7 +247,7 @@ pub fn spawn_tailscale_engine_with_tun(cfg: TailscaleConfig, local_ip: IpAddr, m
             .add_default_ipv6_route(std::net::Ipv6Addr::UNSPECIFIED);
 
         let mut sockets = SocketSet::new(vec![]);
-        let mut web = cfg.luci_access.then(super::web::WebBridge::new);
+        let mut web = cfg.luci_access.then(|| super::web::WebBridge::new(cfg.ssh_access));
         let mut tcp_conns: HashMap<u32, TcpConn> = HashMap::new();
         let mut udp_sessions: HashMap<
             u16,
