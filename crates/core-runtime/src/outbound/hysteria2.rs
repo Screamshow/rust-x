@@ -105,7 +105,7 @@ impl Hysteria2 {
             Some(_) => anyhow::bail!("{at}: obfs must be an object"),
         };
 
-        let (server_port_ranges, port) = if let Some(ports) = obj.get("server_ports") {
+        let (mut server_port_ranges, port) = if let Some(ports) = obj.get("server_ports") {
             let mut ranges = Vec::new();
             let list = match ports {
                 Value::String(s) => vec![s.as_str()],
@@ -135,6 +135,14 @@ impl Hysteria2 {
             (Vec::new(), port)
         };
 
+        // A singleton (including duplicate singleton entries) cannot hop.
+        // Keep the native QUIC socket path and avoid retiring a usable connection.
+        if server_port_ranges
+            .iter()
+            .all(|&(start, end)| start == port && end == port)
+        {
+            server_port_ranges.clear();
+        }
         let hop_interval = if !server_port_ranges.is_empty() {
             parse_duration(
                 obj.get("hop_interval"),
@@ -788,6 +796,30 @@ fn send_hy2_datagram(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn singleton_ports_use_fixed_port_without_disabling_obfs() {
+        for (ports, hopping) in [
+            (serde_json::json!(["8443:8443"]), false),
+            (serde_json::json!(["8443:8443", "8443:8443"]), false),
+            (serde_json::json!(["8443:8444"]), true),
+            (serde_json::json!(["8443:8443", "9443:9443"]), true),
+        ] {
+            let cfg = serde_json::json!({
+                "server": "127.0.0.1", "server_port": 443,
+                "server_ports": ports, "password": "test",
+                "obfs": {"type": "salamander", "password": "obfs-test"},
+                "tls": {"enabled": true, "insecure": true}
+            });
+            let outbound = Hysteria2::build(cfg.as_object().unwrap(), "test").unwrap();
+            assert_eq!(outbound.port, 8443);
+            assert_eq!(!outbound.server_port_ranges.is_empty(), hopping);
+            assert_eq!(
+                outbound.obfs_password.as_deref(),
+                Some(b"obfs-test".as_slice())
+            );
+        }
+    }
 
     #[test]
     fn hy2_packet_roundtrip() {
