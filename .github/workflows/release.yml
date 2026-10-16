@@ -153,8 +153,8 @@ jobs:
           ver="${{ inputs.tag || github.ref_name }}"
           ver="${ver#rust-x-v}"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
-          if [ -f "RELEASE-NOTES-$ver.md" ]; then
-            cp "RELEASE-NOTES-$ver.md" notes.md
+          if [ -f "docs/releases/$ver.md" ]; then
+            cp "docs/releases/$ver.md" notes.md
             exit 0
           fi
           awk -v want="## $ver" '

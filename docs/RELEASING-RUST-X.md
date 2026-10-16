@@ -5,7 +5,7 @@ key and apk-tools as Sing-Box X. The private signing key stays on that host.
 No new runner or signing key in GitHub Secrets is required.
 
 1. Commit the release source on main with matching workspace/lockfile version
-   and RELEASE-NOTES-VERSION.md. Push a matching `rust-x-vVERSION` tag.
+   and docs/releases/VERSION.md. Push a matching `rust-x-vVERSION` tag.
 2. The workflow builds static x86_64 and ARM64 binaries, enforces the size budget,
    packages APK/IPK, and creates a draft with the source manifest. Unsigned build
    packages are never intentionally published as a public release.
