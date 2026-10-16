@@ -20,9 +20,9 @@
 //!
 //! Ported from `sing-vmess/vless/vision.go`.
 //!
-//! Receivers can enter Direct independently. A writer replies with Direct only
-//! after its peer has established eligibility by sending Direct; otherwise it
-//! retains the compatible PaddingEnd path. Raw writes start only after the final
+//! Receivers and writers can enter Direct independently. The client checks the
+//! inner ServerHello for TLS 1.3 and a supported cipher before initiating Direct.
+//! Otherwise it retains the compatible PaddingEnd path. Raw writes start only after the final
 //! padded frame has been completely accepted by the TLS writer.
 
 use std::io;
@@ -58,6 +58,119 @@ const READ_CHUNK: usize = 32 * 1024;
 /// arrival is what takes the padding phase out.
 const TLS_APP_DATA: [u8; 3] = [0x17, 0x03, 0x03];
 
+/// Inspect only the first inner ServerHello. Both TCP and TLS handshake
+/// fragmentation are allowed; malformed or oversized input disables detection.
+#[derive(Default)]
+struct ServerHello {
+    record: Vec<u8>,
+    handshake: Vec<u8>,
+    done: bool,
+    eligible: bool,
+}
+
+impl ServerHello {
+    fn stop(&mut self, eligible: bool) {
+        self.done = true;
+        self.eligible = eligible;
+        self.record = Vec::new();
+        self.handshake = Vec::new();
+    }
+
+    fn feed(&mut self, mut input: &[u8]) {
+        while !self.done && !input.is_empty() {
+            let target = if self.record.len() < 5 {
+                5
+            } else {
+                5 + usize::from(u16::from_be_bytes([self.record[3], self.record[4]]))
+            };
+            let take = (target - self.record.len()).min(input.len());
+            self.record.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.record.len() < 5 {
+                continue;
+            }
+            let size = usize::from(u16::from_be_bytes([self.record[3], self.record[4]]));
+            if self.record[..3] != [0x16, 0x03, 0x03] || size == 0 || size > 16384 {
+                self.stop(false);
+                return;
+            }
+            if self.record.len() < size + 5 {
+                continue;
+            }
+            if self.handshake.len() + size > 65536 {
+                self.stop(false);
+                return;
+            }
+            self.handshake.extend_from_slice(&self.record[5..]);
+            self.record.clear();
+            if self.handshake.len() < 4 {
+                continue;
+            }
+            let size = (usize::from(self.handshake[1]) << 16)
+                | (usize::from(self.handshake[2]) << 8)
+                | usize::from(self.handshake[3]);
+            if self.handshake[0] != 2 || size > 65532 {
+                self.stop(false);
+                return;
+            }
+            if self.handshake.len() >= size + 4 {
+                let eligible = Self::parse(&self.handshake[4..size + 4]);
+                self.stop(eligible);
+            }
+        }
+    }
+
+    fn parse(body: &[u8]) -> bool {
+        if body.len() < 38 || body[..2] != [3, 3] {
+            return false;
+        }
+        // HelloRetryRequest is not the negotiated ServerHello. Conservatively
+        // keep outer encryption for this uncommon path.
+        const RETRY: [u8; 32] = [
+            0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65,
+            0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
+            0xc8, 0xa8, 0x33, 0x9c,
+        ];
+        if body[2..34] == RETRY || body[34] > 32 {
+            return false;
+        }
+        let at = 35 + usize::from(body[34]);
+        if body.len() < at + 5 || body[at + 2] != 0 {
+            return false;
+        }
+        let cipher = u16::from_be_bytes([body[at], body[at + 1]]);
+        // Match Xray's supported set, excluding CCM_8 (0x1305).
+        if !matches!(cipher, 0x1301..=0x1304) {
+            return false;
+        }
+        let extensions = usize::from(u16::from_be_bytes([body[at + 3], body[at + 4]]));
+        let mut rest = &body[at + 5..];
+        if rest.len() != extensions {
+            return false;
+        }
+        let mut tls13 = false;
+        while !rest.is_empty() {
+            if rest.len() < 4 {
+                return false;
+            }
+            let kind = u16::from_be_bytes([rest[0], rest[1]]);
+            let size = usize::from(u16::from_be_bytes([rest[2], rest[3]]));
+            rest = &rest[4..];
+            if rest.len() < size {
+                return false;
+            }
+            if kind == 43 {
+                if tls13 || rest[..size] != [3, 4] {
+                    return false;
+                }
+                tls13 = true;
+            }
+            rest = &rest[size..];
+        }
+        tls13
+    }
+}
+
 pub struct VisionStream {
     inner: AnyStream,
     uuid: [u8; 16],
@@ -87,6 +200,7 @@ pub struct VisionStream {
     eof: bool,
     direct_read: bool,
     direct_write_pending: bool,
+    server_hello: ServerHello,
 }
 
 impl VisionStream {
@@ -109,6 +223,7 @@ impl VisionStream {
             eof: false,
             direct_read: false,
             direct_write_pending: false,
+            server_hello: ServerHello::default(),
         }
     }
 
@@ -166,10 +281,12 @@ impl VisionStream {
     /// build, and the decision to leave the padding phase for good.
     fn next_command(&mut self, content: &[u8]) -> u8 {
         let command = if self.saw_tls && Self::is_tls_app_data(content) {
-            // A peer that has already sent Direct has established TLS 1.3
-            // eligibility. Reply symmetrically, without guessing from a TLS 1.2
-            // application-data header. Local read Direct also proves raw capability.
-            if self.direct_read {
+            // The negotiated inner TLS version/cipher qualifies uploads even
+            // when the peer has not sent its own Direct command yet.
+            if self.direct_read
+                || (self.server_hello.eligible
+                    && crate::inbound::supports_vision_direct(&mut self.inner))
+            {
                 self.direct_write_pending = true;
                 PADDING_DIRECT
             } else {
@@ -184,6 +301,7 @@ impl VisionStream {
         };
         if command != PADDING_CONTINUE {
             self.padding = false;
+            self.server_hello.stop(false);
         }
         command
     }
@@ -281,6 +399,7 @@ impl AsyncRead for VisionStream {
             }
             if !this.payload.is_empty() {
                 let take = this.payload.len().min(out.remaining());
+                this.server_hello.feed(&this.payload[..take]);
                 out.put_slice(&this.payload[..take]);
                 let _ = this.payload.split_to(take);
                 if this.payload.is_empty()
@@ -303,7 +422,12 @@ impl AsyncRead for VisionStream {
                 // bytes belong to the inner stream; retain neither staging buffer.
                 this.raw = BytesMut::new();
                 this.payload = BytesMut::new();
-                return std::pin::Pin::new(&mut this.inner).poll_read(cx, out);
+                let start = out.filled().len();
+                let result = std::pin::Pin::new(&mut this.inner).poll_read(cx, out);
+                if matches!(result, std::task::Poll::Ready(Ok(()))) {
+                    this.server_hello.feed(&out.filled()[start..]);
+                }
+                return result;
             }
             if this.eof {
                 return std::task::Poll::Ready(Ok(()));
@@ -429,6 +553,84 @@ impl AsyncWrite for VisionStream {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn hello(cipher: u16, version: [u8; 2]) -> Vec<u8> {
+        let mut body = vec![3, 3];
+        body.extend_from_slice(&[0x42; 32]);
+        body.push(0);
+        body.extend_from_slice(&cipher.to_be_bytes());
+        body.extend_from_slice(&[0, 0, 6, 0, 43, 0, 2]);
+        body.extend_from_slice(&version);
+        let mut handshake = vec![2, 0, 0, body.len() as u8];
+        handshake.extend_from_slice(&body);
+        handshake
+    }
+
+    fn handshake_record(body: &[u8]) -> Vec<u8> {
+        let mut record = vec![0x16, 3, 3];
+        record.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        record.extend_from_slice(body);
+        record
+    }
+
+    #[test]
+    fn server_hello_qualification_and_fragmentation() {
+        for cipher in 0x1301..=0x1304 {
+            let handshake = hello(cipher, [3, 4]);
+            for split in 1..handshake.len() {
+                let mut wire = handshake_record(&handshake[..split]);
+                wire.extend(handshake_record(&handshake[split..]));
+                let mut detector = ServerHello::default();
+                for byte in wire {
+                    detector.feed(&[byte]);
+                }
+                assert!(detector.eligible);
+                assert!(detector.done);
+                assert_eq!(detector.record.capacity(), 0);
+                assert_eq!(detector.handshake.capacity(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_and_malformed_hellos_keep_outer_tls() {
+        for (cipher, version) in [(0x1305, [3, 4]), (0xffff, [3, 4]), (0x1301, [3, 3])] {
+            let mut detector = ServerHello::default();
+            detector.feed(&handshake_record(&hello(cipher, version)));
+            assert!(detector.done && !detector.eligible);
+        }
+        let mut bad = hello(0x1301, [3, 4]);
+        bad[4 + 34] = 255;
+        assert!(!ServerHello::parse(&bad[4..]));
+        let good = hello(0x1301, [3, 4]);
+        for length in 0..good.len() - 4 {
+            assert!(!ServerHello::parse(&good[4..4 + length]));
+        }
+        for wire in [vec![0x16, 3, 3, 0xff, 0xff], vec![0x17, 3, 3, 0, 1, 0]] {
+            let mut detector = ServerHello::default();
+            detector.feed(&wire);
+            assert!(detector.done && !detector.eligible);
+        }
+    }
+
+    #[tokio::test]
+    async fn inner_server_hello_is_detected_before_peer_direct() {
+        let (mut client, mut peer) = pair();
+        let wire = wire_frame(
+            true,
+            PADDING_CONTINUE,
+            &handshake_record(&hello(0x1301, [3, 4])),
+            0,
+        );
+        peer.write_all(&wire).await.unwrap();
+        let mut received = vec![0; handshake_record(&hello(0x1301, [3, 4])).len()];
+        client.read_exact(&mut received).await.unwrap();
+        assert!(client.server_hello.eligible);
+        assert!(!client.direct_read);
+        // A duplex/unsupported outer transport must never advertise raw mode.
+        client.saw_tls = true;
+        assert_eq!(client.next_command(&[0x17, 3, 3, 0, 1, 0]), PADDING_END);
+    }
 
     fn uuid() -> [u8; 16] {
         [7u8; 16]

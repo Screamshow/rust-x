@@ -254,6 +254,10 @@ impl VlessStream {
         crate::inbound::enable_vision_direct_write(&mut self.inner)
     }
 
+    pub(crate) fn supports_vision_direct(&mut self) -> bool {
+        crate::inbound::supports_vision_direct(&mut self.inner)
+    }
+
     pub(crate) fn enable_vision_direct_read(&mut self) -> bool {
         crate::inbound::enable_vision_direct_read(&mut self.inner)
     }

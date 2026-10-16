@@ -124,6 +124,18 @@ pub(crate) fn enable_vision_direct_read(stream: &mut AnyStream) -> bool {
     false
 }
 
+/// Only the TCP fingerprint TLS wrapper exposes a compatible raw transport.
+pub(crate) fn supports_vision_direct(stream: &mut AnyStream) -> bool {
+    let stream = (**stream).as_any_mut();
+    if let Some(alpn) = stream.downcast_mut::<AlpnStream>() {
+        return supports_vision_direct(&mut alpn.inner);
+    }
+    if let Some(vless) = stream.downcast_mut::<crate::outbound::secure::VlessStream>() {
+        return vless.supports_vision_direct();
+    }
+    stream.is::<crate::tls_utls::FingerprintStream<TcpStream>>()
+}
+
 /// Enter raw writes only after the last encrypted Vision frame was drained.
 pub(crate) fn enable_vision_direct_write(stream: &mut AnyStream) -> bool {
     let stream = (**stream).as_any_mut();
