@@ -49,6 +49,7 @@ pub struct FingerprintStream<S> {
     pending_plaintext: usize,
     eof: bool,
     direct_read: bool,
+    direct_write: bool,
 }
 
 impl<S> FingerprintStream<S> {
@@ -67,6 +68,7 @@ impl<S> FingerprintStream<S> {
             pending_plaintext: 0,
             eof: false,
             direct_read: false,
+            direct_write: false,
         }
     }
 
@@ -85,6 +87,15 @@ impl<S> FingerprintStream<S> {
     pub(crate) fn enable_direct_read(&mut self) {
         self.direct_read = true;
         self.release_direct_read_buffer();
+    }
+
+    pub(crate) fn enable_direct_write(&mut self) -> bool {
+        if self.out.is_some() {
+            return false;
+        }
+        self.direct_write = true;
+        self.wbuf = Vec::new();
+        true
     }
 
     fn release_direct_read_buffer(&mut self) {
@@ -216,6 +227,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if me.direct_write {
+            return Pin::new(&mut me.inner).poll_write(cx, buf);
+        }
         // one record per call, so the sequence number moves with each record
         // rather than with each call. A caller with more than a record's worth
         // writes it in pieces: `write_record` refuses more, and the number handed
@@ -335,6 +349,7 @@ mod memory_tests {
         let verifier = WebpkiVerifier::new(Arc::new(roots)).unwrap();
         let template = core_tls::fingerprints::by_name("chrome").unwrap();
         let (mut client, peer) = tokio::io::duplex(CHUNK);
+        let (ready_send, ready_recv) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
                 .accept(peer)
@@ -343,6 +358,11 @@ mod memory_tests {
             let mut request = [0; 2];
             tls.read_exact(&mut request).await.unwrap();
             assert_eq!(&request, b"hi");
+            ready_send.send(()).unwrap();
+            let (mut raw, _) = tls.into_inner();
+            let mut tail = [0; 3];
+            raw.read_exact(&mut tail).await.unwrap();
+            assert_eq!(&tail, b"RAW");
         });
         let mut handshake = Handshake::new(Config {
             template: &template,
@@ -385,6 +405,10 @@ mod memory_tests {
                 .poll_write(&mut cx, b"hi")
                 .is_pending()
         );
+        assert!(
+            !stream.enable_direct_write(),
+            "pending ciphertext must drain first"
+        );
         // The relay may append input while its writer is pending. Only the
         // original record's plaintext was consumed, even if this slice grew.
         let written = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write(cx, b"hiEXTRA"))
@@ -394,6 +418,12 @@ mod memory_tests {
             written, 2,
             "must report the pending record's original length"
         );
+        ready_recv.await.unwrap();
+        assert!(stream.enable_direct_write());
+        assert_eq!(stream.wbuf.capacity(), 0);
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"RAW")
+            .await
+            .unwrap();
         server.await.unwrap();
     }
 

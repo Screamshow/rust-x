@@ -250,6 +250,10 @@ pub struct VlessStream {
 }
 
 impl VlessStream {
+    pub(crate) fn enable_vision_direct_write(&mut self) -> bool {
+        crate::inbound::enable_vision_direct_write(&mut self.inner)
+    }
+
     pub(crate) fn enable_vision_direct_read(&mut self) -> bool {
         crate::inbound::enable_vision_direct_read(&mut self.inner)
     }

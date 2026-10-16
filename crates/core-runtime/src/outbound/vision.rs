@@ -18,11 +18,12 @@
 //! reference is the other half: `Continue` keeps parsing frames, anything else
 //! hands the rest through untouched.
 //!
-//! Ported from `sing-vmess/vless/vision.go`. The XTLS "direct" mode (writing
-//! through the TLS layer without re-encrypting, chosen once a TLS 1.3 handshake
-//! is seen) is deliberately not implemented: it needs a handle to the raw
-//! connection below the cipher. Receiving `CommandPaddingDirect` switches the
-//! peer's read direction to raw transport after its final padded frame.
+//! Ported from `sing-vmess/vless/vision.go`.
+//!
+//! Receivers can enter Direct independently. A writer replies with Direct only
+//! after its peer has established eligibility by sending Direct; otherwise it
+//! retains the compatible PaddingEnd path. Raw writes start only after the final
+//! padded frame has been completely accepted by the TLS writer.
 
 use std::io;
 
@@ -31,8 +32,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::inbound::AnyStream;
 
-/// The three commands of the reference (`proxy.go`). Only Continue and End are
-/// ever sent; Direct would need the raw connection underneath.
+/// The three commands of the reference (`proxy.go`).
 const PADDING_CONTINUE: u8 = 0x00;
 const PADDING_END: u8 = 0x01;
 const PADDING_DIRECT: u8 = 0x02;
@@ -86,6 +86,7 @@ pub struct VisionStream {
     payload: BytesMut,
     eof: bool,
     direct_read: bool,
+    direct_write_pending: bool,
 }
 
 impl VisionStream {
@@ -107,6 +108,7 @@ impl VisionStream {
             payload: BytesMut::new(),
             eof: false,
             direct_read: false,
+            direct_write_pending: false,
         }
     }
 
@@ -164,7 +166,15 @@ impl VisionStream {
     /// build, and the decision to leave the padding phase for good.
     fn next_command(&mut self, content: &[u8]) -> u8 {
         let command = if self.saw_tls && Self::is_tls_app_data(content) {
-            PADDING_END
+            // A peer that has already sent Direct has established TLS 1.3
+            // eligibility. Reply symmetrically, without guessing from a TLS 1.2
+            // application-data header. Local read Direct also proves raw capability.
+            if self.direct_read {
+                self.direct_write_pending = true;
+                PADDING_DIRECT
+            } else {
+                PADDING_END
+            }
         } else if !self.saw_tls && self.packets_to_filter <= 1 {
             // traffic that never turned out to be TLS leaves the phase early, for
             // compatibility with receivers that gave up waiting
@@ -351,6 +361,14 @@ impl AsyncWrite for VisionStream {
                     std::task::Poll::Ready(Ok(n)) => {
                         this.framed_at += n;
                         if this.framed_at == this.framed.len() {
+                            if this.direct_write_pending {
+                                if !crate::inbound::enable_vision_direct_write(&mut this.inner) {
+                                    return std::task::Poll::Ready(Err(io::Error::other(
+                                        "Vision Direct write requires a drained raw-capable TLS stream",
+                                    )));
+                                }
+                                this.direct_write_pending = false;
+                            }
                             this.framed.clear();
                             if !this.padding {
                                 this.framed = Vec::new();
@@ -699,6 +717,21 @@ mod tests {
         sink.eof = true;
         sink.unpad();
         assert_eq!(&sink.payload[..], &b"plain bytes"[..]);
+    }
+
+    #[test]
+    fn direct_write_requires_peer_direct_and_a_complete_inner_record() {
+        let record = [0x17, 0x03, 0x03, 0, 2, 1, 2];
+        let (mut ordinary, _) = pair();
+        ordinary.saw_tls = true;
+        assert_eq!(ordinary.next_command(&record), PADDING_END);
+        let (mut direct, _) = pair();
+        direct.saw_tls = true;
+        direct.direct_read = true;
+        assert_eq!(direct.next_command(&record[..6]), PADDING_CONTINUE);
+        assert!(!direct.direct_write_pending);
+        assert_eq!(direct.next_command(&record), PADDING_DIRECT);
+        assert!(direct.direct_write_pending);
     }
 
     #[test]

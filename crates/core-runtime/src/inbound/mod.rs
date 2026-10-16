@@ -124,6 +124,21 @@ pub(crate) fn enable_vision_direct_read(stream: &mut AnyStream) -> bool {
     false
 }
 
+/// Enter raw writes only after the last encrypted Vision frame was drained.
+pub(crate) fn enable_vision_direct_write(stream: &mut AnyStream) -> bool {
+    let stream = (**stream).as_any_mut();
+    if let Some(alpn) = stream.downcast_mut::<AlpnStream>() {
+        return enable_vision_direct_write(&mut alpn.inner);
+    }
+    if let Some(vless) = stream.downcast_mut::<crate::outbound::secure::VlessStream>() {
+        return vless.enable_vision_direct_write();
+    }
+    if let Some(tls) = stream.downcast_mut::<crate::tls_utls::FingerprintStream<TcpStream>>() {
+        return tls.enable_direct_write();
+    }
+    false
+}
+
 /// A stream carrying its negotiated ALPN protocol from the TLS handshake.
 pub struct AlpnStream {
     inner: AnyStream,
