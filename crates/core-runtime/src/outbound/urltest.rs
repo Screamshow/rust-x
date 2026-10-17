@@ -197,10 +197,12 @@ async fn probe_all(shared: &Arc<Shared>, router: &Arc<Router>) {
             let permit = sem.acquire().await.expect("probe pool never closes");
             let ms = probe_member(&shared, &router, member).await;
             drop(permit);
-            // Clash DelayHistory: every successful probe records its
-            // post-dial delay; failures do not.
+            // Do not expose an earlier success as current availability
+            // after a failed round (including all retries).
             if let Some(ms) = ms {
                 router.record_delay(member, ms as u32);
+            } else {
+                router.clear_delay(member);
             }
             (pos, ms)
         });

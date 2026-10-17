@@ -130,6 +130,114 @@ async fn manual_group_and_background_tests_exclude_tls_but_keep_timeout() {
     }
     let (status, _) = api(addr, &format!("/proxies/node/delay?timeout=100&url={url}")).await;
     assert_eq!(status, 504, "TLS setup must obey the original deadline");
+    let (_, node) = api(addr, "/proxies/node").await;
+    assert_eq!(
+        node["history"],
+        json!([]),
+        "timeout must invalidate success"
+    );
     instance.shutdown();
     server.abort();
+}
+
+#[tokio::test]
+async fn failed_manual_and_background_probes_clear_previous_success() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let url = format!("http://{endpoint}/generate_204");
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0; 1024];
+            let _ = stream.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await;
+        }
+    });
+    let instance = core_runtime::start(&json!({
+        "log": {"level": "error"},
+        "experimental": {"clash_api": {"external_controller": "127.0.0.1:0"}},
+        "outbounds": [
+            {"type": "direct", "tag": "node"},
+            {"type": "selector", "tag": "selector", "outbounds": ["node"]},
+            {"type": "urltest", "tag": "provider", "outbounds": ["node"], "url": url, "interval": "1h"}
+        ],
+        "route": {"final": "provider"}
+    })).await.unwrap();
+    let addr = instance.clash_api_addr().unwrap();
+    // A closed target models the old port left behind in a subscription.
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_url = format!("http://{}/", closed.local_addr().unwrap());
+    drop(closed);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, info) = api(addr, "/proxies/node").await;
+            if !info["history"].as_array().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for path in [
+        "/proxies/node/delay",
+        "/group/provider/delay",
+        "/proxies/selector/delay",
+    ] {
+        assert_eq!(
+            api(addr, &format!("{path}?timeout=2000&url={url}")).await.0,
+            200
+        );
+        assert_eq!(
+            api(addr, &format!("{path}?timeout=2000&url={dead_url}"))
+                .await
+                .0,
+            503
+        );
+        for tag in ["node", "selector", "provider"] {
+            let (_, info) = api(addr, &format!("/proxies/{tag}")).await;
+            assert_eq!(info["history"], json!([]), "stale success for {tag}");
+        }
+    }
+    instance.shutdown_wait().await;
+    // A separate instance lets the background loop own both transitions.
+    let instance = core_runtime::start(&json!({
+        "log": {"level": "error"},
+        "experimental": {"clash_api": {"external_controller": "127.0.0.1:0"}},
+        "outbounds": [
+            {"type": "direct", "tag": "node"},
+            {"type": "urltest", "tag": "provider", "outbounds": ["node"], "url": url, "interval": "100ms"}
+        ],
+        "route": {"final": "provider"}
+    })).await.unwrap();
+    let addr = instance.clash_api_addr().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (_, info) = api(addr, "/proxies/node").await;
+            if !info["history"].as_array().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (_, info) = api(addr, "/proxies/node").await;
+            if info["history"] == json!([]) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed background round must clear the successful history");
+    let (_, group) = api(addr, "/proxies/provider").await;
+    assert_eq!(group["history"], json!([]));
+    instance.shutdown_wait().await;
 }

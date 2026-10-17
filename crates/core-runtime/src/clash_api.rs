@@ -1444,8 +1444,12 @@ async fn delay_test(
         u16::try_from(start.elapsed().as_millis()).ok()
     };
     match tokio::time::timeout(deadline, test).await {
-        Err(_) => respond_json(stream, 504, "Gateway Timeout", &timeout_err(), cors).await,
+        Err(_) => {
+            router.clear_delay(index);
+            respond_json(stream, 504, "Gateway Timeout", &timeout_err(), cors).await
+        }
         Ok(None) | Ok(Some(0)) => {
+            router.clear_delay(index);
             respond_json(stream, 503, "Service Unavailable", &delay_err(), cors).await
         }
         Ok(Some(delay)) => {

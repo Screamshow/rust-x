@@ -818,6 +818,14 @@ impl RouterInner {
         *slot.lock().expect("delay history") = Some((ts, delay));
     }
 
+    /// A failed probe invalidates the previous successful measurement.
+    pub fn clear_delay(&self, index: usize) {
+        let index = self.delay_provenance_index(index);
+        if let Some(slot) = self.delay_history.get(index) {
+            *slot.lock().expect("delay history") = None;
+        }
+    }
+
     /// The stored record behind `index`, groups resolving to their member.
     pub fn delay_history(&self, index: usize) -> Option<(String, u32)> {
         self.delay_history
@@ -1228,6 +1236,10 @@ impl Router {
 
     pub fn record_delay(&self, index: usize, delay: u32) {
         self.inner().record_delay(index, delay);
+    }
+
+    pub fn clear_delay(&self, index: usize) {
+        self.inner().clear_delay(index);
     }
 
     pub fn delay_history(&self, index: usize) -> Option<(String, u32)> {
@@ -1759,7 +1771,7 @@ mod tests {
         let router = Router::new(&json!({
             "outbounds": [
                 {"type": "direct", "tag": "d1"},
-                {"type": "socks", "tag": "dead", "server": "127.0.0.1", "server_port": 1},
+                {"type": "direct", "tag": "dead"},
                 {"type": "selector", "tag": "sel", "outbounds": ["d1", "dead"]}
             ],
             "route": {"final": "d1"}
@@ -1788,6 +1800,12 @@ mod tests {
         router.record_delay(d1, 700);
         let (_, delay) = router.delay_history(d1).expect("recorded");
         assert_eq!(delay, 700, "one slot, replaced per probe");
+        router.select_member("sel", "d1").unwrap();
+        router.clear_delay(sel);
+        assert!(router.delay_history(d1).is_none());
+        assert!(router.delay_history(sel).is_none());
+        router.record_delay(d1, 701);
+        assert_eq!(router.delay_history(sel).unwrap().1, 701, "recovery");
     }
 
     #[tokio::test]
